@@ -161,8 +161,10 @@ interface ResolvedConfig {
  * `/sessions`, `/attachments`, `/spill`, `/agents`, `/skills`, and `/AGENTS.md`
  * are read-only on purpose: the harness writes them from outside the sandbox, and
  * a confined process needs to read spilled results, skills, and instructions,
- * never to forge or delete them. Each bind is skipped when its host source is
- * absent, which is the same state the tool side reports as `FS_NOT_FOUND`.
+ * never to forge or delete them. Every bind — the system roots included — is
+ * skipped when its host source is absent, because a distribution that has no
+ * `/opt` or no `/sbin` would otherwise make bubblewrap refuse the whole profile;
+ * the tool side reports the same absence as `FS_NOT_FOUND`.
  *
  * @param policy - the per-call file-effect policy; the workspace root is canonical.
  * @param config - the resolved mount profile.
@@ -172,7 +174,7 @@ export function profileArgs(policy: SandboxPolicy, config: ResolvedConfig): stri
   const workspaceWritable = policy.mode === 'workspace-write'
   const args: string[] = []
 
-  for (const root of config.systemReadOnlyRoots) args.push('--ro-bind', root, root)
+  for (const root of config.systemReadOnlyRoots) bindIfPresent(args, root, root, false)
 
   for (const root of config.maskedRoots) args.push('--tmpfs', root)
 
@@ -215,7 +217,7 @@ export class BwrapSandboxProvider extends SandboxProvider {
 
   private readonly resolved: ResolvedConfig
   /** Probe verdict, resolved once on the first `confine()`. */
-  private usable: boolean | undefined
+  private usability: { ok: boolean; reason: string } | undefined
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
@@ -254,8 +256,12 @@ export class BwrapSandboxProvider extends SandboxProvider {
     }
     const workspaceRoot = canonicalPath(policy.workspaceRoot)
     const profile = profileArgs({ ...policy, workspaceRoot }, this.resolved)
-    if (!this.isUsable(profile)) {
-      throw new SandboxUnavailableError(policy.mode, 'bwrap could not build the mount profile on this host')
+    const usability = this.usabilityOf(profile)
+    if (!usability.ok) {
+      throw new SandboxUnavailableError(
+        policy.mode,
+        `bwrap could not build the mount profile on this host: ${usability.reason}`,
+      )
     }
     return {
       argv: ['bwrap', ...profile, '--', ...argv],
@@ -269,11 +275,88 @@ export class BwrapSandboxProvider extends SandboxProvider {
    * The functional probe: actually build the profile and run `true` under it.
    * A version check would miss a kernel or host that has `bwrap` but refuses
    * the namespace, so restricting a real process is the only honest signal.
+   *
+   * The verdict includes bubblewrap's own first diagnostic line, because that
+   * line is almost always the answer: a bind source that does not exist (the
+   * session workspace, a store), a namespace the host refuses, or a `true` it
+   * cannot execute because the profile omits the shell's own directory. The
+   * caller sees only this detail, so discarding it leaves an unrunnable host
+   * indistinguishable from a malformed profile.
+   *
+   * @param profile - the profile arguments to test.
+   * @returns the cached verdict, with the reason when it is negative.
    */
-  private isUsable(profile: readonly string[]): boolean {
-    this.usable ??= spawnSync('bwrap', [...profile, '--', 'true'], { stdio: 'ignore' }).status === 0
-    return this.usable
+  private usabilityOf(profile: readonly string[]): { ok: boolean; reason: string } {
+    this.usability ??= this.probe(profile)
+    return this.usability
   }
+
+  /**
+   * Run the probe once and classify its outcome.
+   * @param profile - the profile arguments to test.
+   * @returns `ok` with an empty reason, or the reported reason.
+   */
+  private probe(profile: readonly string[]): { ok: boolean; reason: string } {
+    const argv = ['bwrap', ...profile, '--', 'true']
+    const probe = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8' })
+    if (probe.error !== undefined) {
+      const code = (probe.error as NodeJS.ErrnoException).code
+      return this.refuse(code === 'ENOENT' ? 'bwrap is not installed' : String(probe.error), argv)
+    }
+    if (probe.status === 0) return { ok: true, reason: '' }
+    const diagnostic = (probe.stderr ?? '').trim().split('\n')[0] ?? ''
+    return this.refuse(diagnostic === '' ? `bwrap exited with status ${probe.status}` : diagnostic, argv)
+  }
+
+  /**
+   * Report a failed probe and return the negative verdict.
+   *
+   * The report goes three places, because each reaches a different reader. The
+   * thrown error is a tool result inside the session, so the model and the
+   * transcript get it. The logger keeps it structured for tests and for the boot
+   * audit. Neither prints: no shipping app installs a console log exporter, and
+   * the boot exporter only surfaces on a startup failure — so the operator
+   * watching the terminal would see a refused command with no reason at all.
+   * Hence the direct stderr write, once per process.
+   *
+   * @param reason - bubblewrap's own diagnostic, or the spawn failure.
+   * @param argv - the exact probe command, for reproduction.
+   * @returns the negative verdict carrying `reason`.
+   */
+  private refuse(reason: string, argv: readonly string[]): { ok: boolean; reason: string } {
+    const report = unavailableReport(reason, argv)
+    this.ctx.logger.error(report)
+    process.stderr.write(`${report}\n`)
+    return { ok: false, reason }
+  }
+}
+
+/**
+ * Compose the operator-facing report for a profile bubblewrap cannot build.
+ *
+ * The command is the part that makes it actionable: it is the exact profile the
+ * provider would have run, so the same failure can be reproduced without the
+ * harness and its mounts inspected by hand.
+ *
+ * @param reason - bubblewrap's own diagnostic, or the spawn failure.
+ * @param argv - the probe command, without the trailing inner command.
+ * @returns the multi-line report.
+ */
+export function unavailableReport(reason: string, argv: readonly string[]): string {
+  return [
+    'dsh-bwrap-sandbox: bwrap cannot build the sandbox profile on this host, so confined commands are refused.',
+    `  reason: ${reason}`,
+    `  reproduce: ${argv.map(quoteForShell).join(' ')}`,
+  ].join('\n')
+}
+
+/**
+ * Quote one argv part so a logged command can be pasted into a shell.
+ * @param part - the argument to quote.
+ * @returns the argument, quoted only when a shell would read it differently.
+ */
+function quoteForShell(part: string): string {
+  return /^[A-Za-z0-9@%+=:,./_-]+$/.test(part) ? part : `'${part.replaceAll("'", String.raw`'\''`)}'`
 }
 
 export default BwrapSandboxProvider

@@ -24,7 +24,7 @@
 
 export { BwrapBashExecutor, name as bashName, withWorkdirArgv, workdirArgument } from './bash.js'
 export type { BashConfig } from './bash.js'
-export { BwrapSandboxProvider, Config as SandboxConfig, name as sandboxName, profileArgs } from './sandbox.js'
+export { BwrapSandboxProvider, Config as SandboxConfig, name as sandboxName, profileArgs, unavailableReport } from './sandbox.js'
 export { WorkspaceFileSystem, Config as FsConfig, name as fsName } from './fs.js'
 export {
   Config as GuardConfig,

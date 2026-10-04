@@ -502,7 +502,27 @@ is exercised through a real registered guard.
   platform, or a host where `bwrap` cannot build the profile, `confine()` throws
   `SANDBOX_UNAVAILABLE` and the command does not run. This replaces the
   platform-chain provider, so the Landlock, Seatbelt, and Windows ACL backends
-  are not reachable in this composition.
+  are not reachable in this composition: a host that refuses the profile — no
+  unprivileged user namespaces, a container that blocks `unshare`, or a missing
+  bind source — runs nothing rather than falling back to a weaker sandbox.
+  Bubblewrap's own diagnostic is reported in the thrown error, in the log, and on
+  stderr, together with the exact `bwrap …` command to reproduce:
+
+  ```
+  dsh-bwrap-sandbox: bwrap cannot build the sandbox profile on this host, so confined commands are refused.
+    reason: bwrap: setting up uid map: Permission denied
+    reproduce: bwrap --tmpfs /home ... --bind /the/workspace /workspace --chdir /workspace ... -- true
+  ```
+
+  `setting up uid map: Permission denied` is the common container and
+  hardened-kernel failure. On a hardened host the knobs are
+  `kernel.unprivileged_userns_clone` and
+  `kernel.apparmor_restrict_unprivileged_userns` (`sysctl -w`); inside a
+  container, `unshare` must be permitted (`--cap-add SYS_ADMIN` plus a seccomp
+  profile that allows it), or `bwrap` installed setuid-root. Every bind source —
+  the system roots included — is skipped when it does not exist, because a
+  distribution without `/opt` or `/sbin` would otherwise take the whole workspace
+  down with it.
 - **`danger-full-access` bypasses the sandbox.** The mode's consumers spawn
   their own argv and never call `ctx.sandbox.confine()`. The filesystem fence is
   independent and still applies, but a shell in that mode is unconfined.
