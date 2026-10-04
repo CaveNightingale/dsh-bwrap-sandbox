@@ -1,6 +1,6 @@
 # dsh-bwrap-sandbox: bubblewrap confinement plus workspace-fenced filesystem tools.
 #
-# Four rows are applied as one bundle layer over dsh-base and the app layer:
+# Rows are applied as one bundle layer over dsh-base and the app layer:
 #
 #   1. `sandbox`     — disable the platform sandbox provider (`dsh-sandbox-local`)
 #                      so this bundle's bwrap-only provider registers `ctx.sandbox`.
@@ -25,7 +25,10 @@
 #                      backend.
 #
 # `sandbox-policy` stays mounted: it owns the per-session mode and workspace root
-# both providers resolve.
+# both providers resolve. Its fallback root is restated in the execution world's
+# spelling, which is what the field's contract asks for and what every consumer
+# now receives — an agent session resolves its own cwd, and `fs-bwrap` reports
+# that cwd as `/workspace`.
 
 - id: sandbox
   disabled: true
@@ -39,14 +42,39 @@
 - id: spill-local
   disabled: true
 
+# `grep` and `glob` spawn the packaged ripgrep on the harness HOST and hand it
+# the model's path, so the tool's execution world is the host while this
+# namespace's is the sandbox. No path satisfies both: the model knows only
+# `/workspace/...`, which the host does not have, and the tool's default workdir
+# is the session cwd, which is `/workspace` here too. The guard fences their
+# argument, so nothing leaks, but the search itself cannot run — and nothing in
+# this bundle can rewrite an argument a tool passes to its own subprocess.
+# Disabling the row removes both tools from the model's tool list rather than
+# leaving two that always fail. `bash` searches the same tree inside the
+# sandbox, where the path it is given exists.
+- id: tool-fs-search
+  disabled: true
+
+# `mode` is restated because a `config:` patch replaces the whole block, not
+# deep-merges it; keep it in step with the base bundle's row.
+- id: sandbox-policy
+  config:
+    mode: !!js process.env.DSH_PERMISSION_MODE ?? 'workspace-write'
+    workspaceRoot: /workspace
+
 # Project-root discovery walks up from the session cwd probing `<dir>/.git`, and
 # then loads every AGENTS.md/CLAUDE.md between that root and the cwd. Inside the
 # fence there is no ancestor project to find: the workspace mount is the whole
 # visible project, every ancestor probe is answered as absent, and the tools
 # cannot read the ancestors anyway. Clearing the marker list stops the probes
 # outright, so the root is always the session workspace and only its own
-# instructions load. The user-global `$DSH_HOME/AGENTS.md` is still loaded, from
-# the `/AGENTS.md` mount below.
+# instructions load. The user-global file is still loaded, from the `/AGENTS.md`
+# mount below.
+#
+# `dshHome` is the namespace root: the loader joins it with `AGENTS.md`, and the
+# mount that exposes that file read-only is rooted at the same virtual path. A
+# host `$DSH_HOME` here would name a directory this session cannot see, so the
+# user-global instructions would silently stop loading.
 #
 # `maxBytes` is restated because a `config:` patch replaces the whole block, not
 # deep-merges it; keep the value in step with the base bundle's row.
@@ -54,6 +82,18 @@
   config:
     maxBytes: 65536
     projectRootMarkers: []
+    dshHome: /
+
+# The skill loader joins its configured roots with `skills`, then joins each
+# child onto the root it listed, so BOTH roots are namespace spellings: `/skills`
+# is the user-level `$DSH_HOME/skills` mount and `/agents/skills` the user-level
+# agents-home one. Left at their host defaults the loader resolves paths this
+# session cannot see and swallows the failure, which shows up as an empty skill
+# catalog rather than as an error.
+- id: skill-filesystem
+  config:
+    dshHome: /
+    agentsHome: /agents
 
 - insert:
     - id: bwrap-sandbox
@@ -90,6 +130,9 @@
           grep: path
           glob: path
           lsp: file_path
+          bash: workdir
+          pwsh: workdir
+          terminal: cwd
         pathArrayArguments:
           present: files
       # END GENERATED guard-bwrap config

@@ -31,7 +31,7 @@ import type { ShellExecution, ShellExecSpec } from '@deepseek-ai/dsh-shell'
 import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import { assertMountConfig, buildMounts } from './mounts.js'
 import type { MountConfig } from './mounts.js'
-import { FAKE_ROOT, PathDeniedError, hostToVirtual, mapPath } from './paths.js'
+import { FAKE_ROOT, PathDeniedError, declaredRootFor, mapPath } from './paths.js'
 import type { Mount } from './paths.js'
 
 export const name = 'bash-bwrap'
@@ -52,6 +52,7 @@ export const name = 'bash-bwrap'
  * and not these fields. The README carries the same names for every row.
  */
 const mountsSchema = z.object({
+  workspace: z.string().default(''),
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
@@ -68,11 +69,12 @@ export type BashConfig = LocalBashConfig & ReturnType<typeof mountsSchema>
 /**
  * The virtual path a requested working directory maps to.
  *
- * The caller's `workdir` is normally a host path — the tool layer resolves a
- * relative one against the session workspace and passes an absolute one through
- * — so it goes through the mount table first. A path that is already virtual
- * (`/workspace/...`, which is how the model names files everywhere else) names
- * no mount and is read as virtual directly.
+ * The caller's `workdir` is an execution-world path: the tool layer resolves a
+ * relative one against the session cwd, which `/workspace` is, and a model-named
+ * one is refused by the guard when it spells a host path. A session recorded
+ * before the namespace existed asks for its own host directory instead, and that
+ * maps only when it IS the workspace mount's root — the string the operator wrote
+ * into the mount table — so no other host path can start a command.
  *
  * @param workdir - the caller's requested working directory.
  * @param mounts - the mounts in effect for this call.
@@ -80,7 +82,7 @@ export type BashConfig = LocalBashConfig & ReturnType<typeof mountsSchema>
  * @throws {PathDeniedError} when it names no mount, or is the virtual root.
  */
 export function workdirArgument(workdir: string, mounts: readonly Mount[]): string {
-  const mapped = mapPath(hostToVirtual(workdir, mounts) ?? workdir, mounts)
+  const mapped = mapPath(declaredRootFor(workdir, mounts) ?? workdir, mounts)
   if (mapped.host === FAKE_ROOT) {
     throw new PathDeniedError(workdir, `"${workdir}" is the virtual root, not a directory`)
   }
@@ -129,11 +131,19 @@ export class BwrapBashExecutor extends SandboxBashExecutor {
   // schemastery cannot compose it with the mount fields (see `mountsSchema`).
 
   private readonly mountConfig: MountConfig
+  /**
+   * The host directory the mount table anchors at.
+   *
+   * The session spelling is virtual, so this row owns the host side: it is where
+   * the runner spawns and what the mount table resolves against.
+   */
+  private readonly workspace: string
 
   constructor(ctx: Context, config: BashConfig) {
     super(ctx, config)
     // The loader passes these through unvalidated, so resolve them here.
     this.mountConfig = mountsSchema(config)
+    this.workspace = (config.workspace as string) || process.cwd()
     // Fail at load, not as an unreachable directory later.
     assertMountConfig(this.mountConfig)
   }
@@ -186,7 +196,7 @@ export class BwrapBashExecutor extends SandboxBashExecutor {
     if (policy === undefined) {
       throw new Error('bash-bwrap: the execution spec carries no sandbox policy, so the working directory cannot be placed')
     }
-    const mounts = buildMounts(policy.workspaceRoot, this.mountConfig)
+    const mounts = buildMounts(this.workspace, this.mountConfig)
     let virtual: string
     try {
       virtual = workdirArgument(spec.workdir, mounts)
@@ -199,7 +209,7 @@ export class BwrapBashExecutor extends SandboxBashExecutor {
     // Name the real problem instead.
     const complaint = startComplaint(spec.workdir, mounts)
     if (complaint !== undefined) throw new Error(`bash: cannot start in "${spec.workdir}": ${complaint}`)
-    return { virtual, anchor: policy.workspaceRoot }
+    return { virtual, anchor: this.workspace }
   }
 }
 
@@ -211,7 +221,7 @@ export class BwrapBashExecutor extends SandboxBashExecutor {
  * @returns the complaint, phrased to continue "cannot start in ...".
  */
 function startComplaint(workdir: string, mounts: readonly Mount[]): string | undefined {
-  const mapped = mapPath(hostToVirtual(workdir, mounts) ?? workdir, mounts)
+  const mapped = mapPath(declaredRootFor(workdir, mounts) ?? workdir, mounts)
   if (mapped.host === FAKE_ROOT) return 'it is the virtual root, not a directory'
   const stats = statSync(mapped.host, { throwIfNoEntry: false })
   if (stats === undefined) return 'it does not exist'

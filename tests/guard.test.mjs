@@ -9,12 +9,21 @@ import {
   resolveArgumentTables,
 } from '../lib/guard.js'
 
+/**
+ * A workspace whose host name differs from the name the sandbox shows.
+ *
+ * The guard anchors its mount table at the deployment's own host directory, so
+ * the fixture passes it explicitly rather than relying on the test process's
+ * working directory.
+ */
+const HOST_WORKSPACE = '/home/deepseek/workspace'
+
 /** Install the guard with `config` and return the registered decision function. */
 function guardFor(config) {
   const guards = []
   const context = new Context()
   context.provide('tools', { guard: fn => guards.push(fn) })
-  applyGuard(context, config)
+  applyGuard(context, { workspace: HOST_WORKSPACE, ...config })
   return guards[0]
 }
 
@@ -102,4 +111,44 @@ test('a configured array tool is read from the argument the table names', () => 
   // misconfigured entry fences nothing.
   const wrong = guardFor({ pathArguments: {}, pathArrayArguments: { attach: 'items' } })
   assert.equal(wrong(call('attach', { files: [{ path: '/etc/passwd' }] })), undefined)
+})
+
+test('a host spelling in a tool argument is refused, naming the visible path', () => {
+  const guard = guardFor({})
+  const denied = guard(call('read', { file_path: `${HOST_WORKSPACE}/notes.md` }, HOST_WORKSPACE))
+  assert.match(denied, /is a host path/)
+  assert.match(denied, /"\/workspace\/notes\.md"/, 'the message names the path the sandbox shows')
+  // The same file under its visible name is still allowed, and a relative path
+  // belongs to the namespace by definition.
+  assert.equal(guard(call('read', { file_path: '/workspace/notes.md' }, HOST_WORKSPACE)), undefined)
+  assert.equal(guard(call('read', { file_path: 'notes.md' }, HOST_WORKSPACE)), undefined)
+})
+
+test('the working-directory arguments are fenced the same way', () => {
+  const guard = guardFor({})
+  for (const [name, args] of [
+    ['bash', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }],
+    ['pwsh', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }],
+    ['terminal', { command: 'ls', cwd: HOST_WORKSPACE }],
+  ]) {
+    assert.match(guard(call(name, args, HOST_WORKSPACE)), /is a host path/, `${name} is fenced by default`)
+  }
+  assert.equal(guard(call('bash', { command: 'ls' }, HOST_WORKSPACE)), undefined)
+  assert.equal(guard(call('bash', { command: 'ls', workdir: 'src' }, HOST_WORKSPACE)), undefined)
+  assert.equal(guard(call('bash', { command: 'ls', workdir: '/workspace/src' }, HOST_WORKSPACE)), undefined)
+})
+
+test('a call without an agent session is fenced against the same mounts', () => {
+  const guard = guardFor({})
+  /** A pending call with no agent, as the SDK and plugin surfaces produce. */
+  const agentless = (name, args) => ({ name, arguments: args })
+  // The anchor is the deployment's configured workspace, so placing a path does
+  // not need a session. The former early return deferred every agentless call to
+  // the backend, which cannot see `grep`, `glob`, `lsp`, `bash`, `pwsh`, or
+  // `terminal` — the tools only this guard covers.
+  assert.match(guard(agentless('read', { file_path: `${HOST_WORKSPACE}/notes.md` })), /is a host path/)
+  assert.match(guard(agentless('read', { file_path: '/etc/passwd' })), /not found/)
+  assert.match(guard(agentless('bash', { command: 'ls', workdir: HOST_WORKSPACE })), /is a host path/)
+  assert.equal(guard(agentless('read', { file_path: '/workspace/notes.md' })), undefined)
+  assert.equal(guard(agentless('bash', { command: 'ls' })), undefined)
 })

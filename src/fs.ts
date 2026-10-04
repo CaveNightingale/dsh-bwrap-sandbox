@@ -28,7 +28,7 @@
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { FsError } from '@deepseek-ai/dsh-fs'
-import type { FsEditOutcome, FsEditRequest, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
+import type { FsDirEntry, FsEditOutcome, FsEditRequest, FsPathInfo, FsTarget, FsVersion, FsWriteIntent, FsWriteOutcome } from '@deepseek-ai/dsh-fs'
 import { LocalFileSystem } from '@deepseek-ai/dsh-fs-local'
 import type { Config as LocalFileConfig } from '@deepseek-ai/dsh-fs-local'
 import { SandboxedFileSystem } from '@deepseek-ai/dsh-fs-sandbox'
@@ -36,7 +36,7 @@ import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { assertMountConfig, buildMounts } from './mounts.js'
 import type { MountConfig } from './mounts.js'
-import { FAKE_ROOT, PathDeniedError, VIRTUAL_WORKSPACE, hostToVirtual, isUnder, mapPath, toVirtualPath } from './paths.js'
+import { FAKE_ROOT, PathDeniedError, VIRTUAL_WORKSPACE, declaredRootFor, hostToVirtual, isUnder, isVirtualPath, mapPath, toVirtualPath, trimSeparator } from './paths.js'
 
 export const name = 'fs-bwrap'
 
@@ -98,13 +98,127 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
    * @throws {FsError} `FS_NOT_FOUND` when no mount reaches the path.
    */
   override async resolve(path: string, opts?: { cwd?: string; signal?: AbortSignal }): Promise<FsTarget> {
-    const cwd = opts?.cwd ?? this.config.cwd
-    const mounts = buildMounts(cwd, this.mountConfig)
-    const virtualCwd = hostToVirtual(cwd, mounts) ?? VIRTUAL_WORKSPACE
-    const virtualPath = hostToVirtual(path, mounts) ?? toVirtualPath(path, virtualCwd)
+    const mounts = this.mounts()
+    const virtualPath = toVirtualPath(path, this.anchor(opts?.cwd, mounts))
     const mapped = this.map(path, virtualPath, mounts)
     const target = await super.resolve(mapped.host, opts)
     return { targetKey: target.targetKey, displayPath: mapped.virtual }
+  }
+
+  /**
+   * Map a raw path the way {@link resolve} does, for the seam's other
+   * path-taking entry point.
+   *
+   * `FsPathInfo` carries a version, a type, and a size and no path, so the value
+   * the local backend built from the mapped host path discloses nothing; the
+   * caller's own argument is the only spelling in play, and it was already a
+   * virtual name to get this far.
+   *
+   * @param path - the caller-supplied path.
+   * @param opts - the resolution cwd and cancellation signal.
+   * @param signal - cancellation signal, when the caller passed one separately.
+   * @returns the path info, or `undefined` when the path does not exist.
+   * @throws {FsError} `FS_NOT_FOUND` when no mount reaches the path.
+   */
+  override async lstat(
+    path: string,
+    opts?: { cwd?: string },
+    signal?: AbortSignal,
+  ): Promise<FsPathInfo | undefined> {
+    const mounts = this.mounts()
+    const virtualPath = toVirtualPath(path, this.anchor(opts?.cwd, mounts))
+    const mapped = this.map(path, virtualPath, mounts)
+    return super.lstat(mapped.host, opts, signal)
+  }
+
+  /**
+   * List a directory, reporting each child under the name the namespace uses.
+   *
+   * The inherited listing resolves every child and reports the host path as that
+   * child target's `displayPath`. Consumers put that straight into model-facing
+   * text — `str_replace_editor`'s directory view prints one line per entry — so
+   * this is the one place where a host spelling would reach the model without an
+   * argument naming it. The child's name is `<listed directory>/<basename>`,
+   * which is the spelling a caller can pass back to any other method.
+   *
+   * A child whose resolved target lies outside every mount — a link pointing out
+   * of the workspace — is omitted rather than listed with an unresolvable
+   * target: the entry's target re-enters this backend for follow-up operations,
+   * and one naming a host path would take those operations outside the fence.
+   * The confined shell still shows the link; this listing agrees with what the
+   * file tools can read.
+   *
+   * @param target - the directory to list.
+   * @param signal - cancellation signal.
+   * @returns the children the fence can name, each with a virtual `displayPath`.
+   */
+  override async listDir(target: FsTarget, signal?: AbortSignal): Promise<FsDirEntry[]> {
+    const entries = await super.listDir(target, signal)
+    const mounts = this.mounts()
+    const parent = trimSeparator(target.displayPath)
+    const listed: FsDirEntry[] = []
+    for (const entry of entries) {
+      if (hostToVirtual(String(entry.target.targetKey), mounts) === undefined) continue
+      listed.push({
+        ...entry,
+        target: {
+          targetKey: entry.target.targetKey,
+          displayPath: parent === '/' ? `/${entry.name}` : `${parent}/${entry.name}`,
+        },
+      })
+    }
+    return listed
+  }
+
+  /**
+   * The path a subprocess in this execution world opens for a target.
+   *
+   * The harness asks the filesystem provider how the execution world spells a
+   * path — the headless bundle derives the session cwd from
+   * `processPath(await resolve('.'))` — and this deployment's execution world is
+   * the bubblewrap namespace, so the answer is the virtual path. Reporting the
+   * host path here is what put one in the session cwd, in the persona suffix the
+   * prompt renders from it, and in every loader that joins the session
+   * workspace.
+   *
+   * @param target - a target from this backend.
+   * @returns the virtual path, or the target key when no mount covers it.
+   */
+  override processPath(target: FsTarget): string {
+    return hostToVirtual(String(target.targetKey), this.mounts()) ?? String(target.targetKey)
+  }
+
+  /**
+   * Map a harness-host path onto the same file in this execution world.
+   * @param hostPath - an absolute path in the harness host filesystem.
+   * @returns the virtual path, or `undefined` when no mount covers `hostPath`.
+   */
+  override processPathFromHostPath(hostPath: string): string | undefined {
+    return hostToVirtual(hostPath, this.mounts())
+  }
+
+  /** The mount table this deployment configured, anchored at its own host root. */
+  private mounts(): ReturnType<typeof buildMounts> {
+    return buildMounts(this.config.cwd, this.mountConfig)
+  }
+
+  /**
+   * The virtual directory a relative path resolves against.
+   *
+   * A caller passes the session workspace, which is `/workspace` in a deployment
+   * whose session cwd came from {@link processPath}. A session recorded before
+   * the namespace existed passes its own host directory instead; that one maps
+   * only when it IS a mount root, the string an operator wrote into the mount
+   * table, so no other host path can anchor anything.
+   *
+   * @param cwd - the caller's working directory, when it named one.
+   * @param mounts - the mounts in effect for this call.
+   * @returns the virtual anchor.
+   */
+  private anchor(cwd: string | undefined, mounts: ReturnType<typeof buildMounts>): string {
+    if (cwd === undefined) return VIRTUAL_WORKSPACE
+    if (isVirtualPath(cwd, mounts)) return cwd
+    return declaredRootFor(cwd, mounts) ?? VIRTUAL_WORKSPACE
   }
 
   /**
@@ -125,9 +239,13 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
       mapped = mapPath(virtualPath, mounts)
     } catch (error) {
       if (!(error instanceof PathDeniedError)) throw error
+      if (process.env.BWRAP_TRACE !== undefined) traceRefusal(requested)
       throw notFound(requested)
     }
-    if (mapped.host === FAKE_ROOT) throw notFound(requested)
+    if (mapped.host === FAKE_ROOT) {
+      if (process.env.BWRAP_TRACE !== undefined) traceRefusal(requested)
+      throw notFound(requested)
+    }
     return { host: mapped.host, virtual: mapped.virtual }
   }
 
@@ -217,6 +335,15 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
  */
 function notFound(requested: string): FsError {
   return new FsError(`cannot access ${JSON.stringify(requested)}: not found`, 'FS_NOT_FOUND')
+}
+
+/**
+ * Temporary diagnostic: report a refused path with the frames that named it.
+ * @param requested - the path the caller supplied.
+ */
+function traceRefusal(requested: string): void {
+  const frames = (new Error().stack ?? '').split('\n').slice(1, 7).map(line => line.trim().replace(/^at /, ''))
+  process.stderr.write(`BWRAP_TRACE ${JSON.stringify(requested)}\n${frames.join('\n')}\n\n`)
 }
 
 export default WorkspaceFileSystem

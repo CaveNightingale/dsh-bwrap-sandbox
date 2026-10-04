@@ -56,6 +56,15 @@ export interface Config {
   /** Host attachment store exposed read-only at `/attachments`; empty resolves `$DSH_HOME/attachments`. */
   attachmentsRoot?: string
   /**
+   * Host workspace directory bound at `/workspace`; empty resolves the process
+   * working directory.
+   *
+   * The harness spells the workspace the way the execution world does, so the
+   * policy this row receives names `/workspace`. The host side is this row's own
+   * fact, and it is what the bind source and the mount table resolve against.
+   */
+  workspace?: string
+  /**
    * Host spill directory exposed read-only at `/spill`; empty resolves
    * `$DSH_HOME/spill`. Must match the `spillRoot` of the `spill-bwrap` and
    * `fs-bwrap` rows, which are configured separately.
@@ -97,6 +106,7 @@ export interface Config {
 export const Config: z<Config> = z.object({
   systemReadOnlyRoots: z.array(z.string()).default(['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc', '/opt']),
   maskedRoots: z.array(z.string()).default(['/home', '/root']),
+  workspace: z.string().default(''),
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
@@ -137,6 +147,8 @@ function bindIfPresent(args: string[], source: string, virtual: string, writable
 interface ResolvedConfig {
   systemReadOnlyRoots: readonly string[]
   maskedRoots: readonly string[]
+  /** Canonical host directory bound at {@link VIRTUAL_WORKSPACE}. */
+  workspace: string
   sessionsRoot: string
   attachmentsRoot: string
   spillRoot: string
@@ -227,6 +239,7 @@ export class BwrapSandboxProvider extends SandboxProvider {
     this.resolved = {
       systemReadOnlyRoots: (config.systemReadOnlyRoots as string[]).map(trimSeparator),
       maskedRoots: (config.maskedRoots as string[]).map(trimSeparator),
+      workspace: canonicalPath((config.workspace as string) || process.cwd()),
       // The stores the model may read through /sessions, /attachments, and /spill.
       sessionsRoot,
       attachmentsRoot,
@@ -242,6 +255,31 @@ export class BwrapSandboxProvider extends SandboxProvider {
   }
 
   /**
+   * The host directory that the policy's workspace root names.
+   *
+   * The policy spells paths the way the execution world does — its own contract
+   * says so — so an agent session reports `/workspace`, and the host side is this
+   * row's configured directory. A session recorded before the namespace existed
+   * reports its own host directory instead, which is honored only when it IS that
+   * configured directory; any other root would confine against the wrong
+   * directory, so it fails closed.
+   *
+   * @param policy - the per-call file-effect policy.
+   * @returns the canonical host workspace directory.
+   * @throws {SandboxUnavailableError} when the policy names a different root.
+   */
+  private hostWorkspaceFor(policy: SandboxPolicy): string {
+    const root = trimSeparator(policy.workspaceRoot)
+    if (root === VIRTUAL_WORKSPACE || root === trimSeparator(this.resolved.workspace)) {
+      return this.resolved.workspace
+    }
+    throw new SandboxUnavailableError(
+      policy.mode,
+      `the sandbox policy names workspace root ${JSON.stringify(policy.workspaceRoot)}, which is neither ${JSON.stringify(VIRTUAL_WORKSPACE)} nor this row's configured workspace directory`,
+    )
+  }
+
+  /**
    * Wrap `argv` in the bubblewrap invocation for `policy`.
    * @param argv - the exact argv the caller is about to spawn.
    * @param policy - the per-call file-effect policy.
@@ -254,7 +292,7 @@ export class BwrapSandboxProvider extends SandboxProvider {
     if (process.platform !== 'linux') {
       throw new SandboxUnavailableError(policy.mode, 'dsh-bwrap-sandbox confines with bubblewrap, which exists only on Linux')
     }
-    const workspaceRoot = canonicalPath(policy.workspaceRoot)
+    const workspaceRoot = this.hostWorkspaceFor(policy)
     const profile = profileArgs({ ...policy, workspaceRoot }, this.resolved)
     const usability = this.usabilityOf(profile)
     if (!usability.ok) {

@@ -43,6 +43,13 @@ export const inject = ['tools']
  */
 export interface Config extends MountConfig {
   /**
+   * The host directory the mount table anchors at. Empty resolves the process
+   * working directory. The guard reads it instead of the session cwd because the
+   * session cwd is an execution-world path, and the mount table's host side is
+   * the deployment's own.
+   */
+  workspace?: string
+  /**
    * Tools to fence, mapped to the argument that names one filesystem path. The
    * shipped table is this field's default, so setting it replaces the whole
    * table; copy the default from `dsh --dump-config` to extend it.
@@ -70,10 +77,15 @@ export interface ArgumentTables {
  * Tools the guard covers by default, mapped to the argument naming one
  * filesystem path.
  *
- * These reach the filesystem without passing through `ctx.fs`: `grep` and
- * `glob` spawn the packaged ripgrep directly, and `lsp` drives language servers.
- * The `fs-bwrap` backend already fences the rest, which is why they appear in
- * both places. This constant is the default of {@link Config.pathArguments}.
+ * Two kinds of argument need this check. `grep`, `glob`, and `lsp` reach the
+ * filesystem without passing through `ctx.fs`, so only a guard stands in front
+ * of them. The rest are here because the backends absorb the host spellings the
+ * harness itself uses, and a tool argument is the model's rather than the
+ * harness's — this check is where that distinction is still visible, since
+ * `bash` and `pwsh` resolve `workdir` in the provider and `terminal` hands
+ * `cwd` to a provider this package does not own.
+ *
+ * This constant is the default of {@link Config.pathArguments}.
  */
 export const DEFAULT_PATH_ARGUMENTS: Readonly<ArgumentTable> = {
   read: 'file_path',
@@ -84,6 +96,9 @@ export const DEFAULT_PATH_ARGUMENTS: Readonly<ArgumentTable> = {
   grep: 'path',
   glob: 'path',
   lsp: 'file_path',
+  bash: 'workdir',
+  pwsh: 'workdir',
+  terminal: 'cwd',
 }
 
 /**
@@ -95,6 +110,7 @@ export const DEFAULT_PATH_ARRAY_ARGUMENTS: Readonly<ArgumentTable> = {
 }
 
 export const Config: z<Config> = z.object({
+  workspace: z.string().default(''),
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
@@ -200,11 +216,7 @@ export function apply(ctx: Context, config: Config): void {
   ctx.tools.guard((exec: Readonly<ToolExecution>): string | undefined => {
     const candidates = candidatePaths(exec, tables)
     if (candidates === undefined || candidates.length === 0) return undefined
-    // Without a session there is no workspace to mount; the filesystem backend
-    // still fences the tools that go through it.
-    const workspace = exec.agent?.session.header.cwd
-    if (workspace === undefined) return undefined
-    const mounts = buildMounts(workspace, config)
+    const mounts = buildMounts((config.workspace as string) || process.cwd(), config)
 
     for (const candidate of candidates) {
       // An omitted path means "the session workspace", which is always allowed.
@@ -212,7 +224,16 @@ export function apply(ctx: Context, config: Config): void {
       if (typeof candidate !== 'string') {
         return `path boundary: ${exec.name} received a non-string path; denying`
       }
-      const virtualPath = hostToVirtual(candidate, mounts) ?? toVirtualPath(candidate, VIRTUAL_WORKSPACE)
+      // A tool argument is the model's. The backend also absorbs the durable
+      // host spellings the harness names (the session cwd, recorded paths),
+      // but those never reach a model: every result presents `displayPath`.
+      // Accepting one here would give the model two names for one file, of
+      // which only one exists inside `bash`.
+      const virtual = hostToVirtual(candidate, mounts)
+      if (virtual !== undefined && virtual !== candidate) {
+        return hostSpelling(candidate, virtual)
+      }
+      const virtualPath = virtual ?? toVirtualPath(candidate, VIRTUAL_WORKSPACE)
       try {
         const mapped = mapPath(virtualPath, mounts)
         if (mapped.host === FAKE_ROOT) return notFound(candidate)
@@ -242,4 +263,20 @@ export function apply(ctx: Context, config: Config): void {
  */
 function notFound(candidate: string): string {
   return `cannot access ${JSON.stringify(candidate)}: not found`
+}
+
+/**
+ * The message a host-spelled argument gets, naming the path the sandbox shows.
+ *
+ * Unlike {@link notFound} this discloses a path, because the caller named the
+ * host spelling itself and the namespace's answer is what every other result
+ * already displays. A model that keeps the host name would read the same file
+ * under `read` and fail to find it under `bash`.
+ *
+ * @param candidate - the tool's argument, for the message.
+ * @param virtual - the path the same file has in the sandbox.
+ * @returns the denial reason.
+ */
+function hostSpelling(candidate: string, virtual: string): string {
+  return `path boundary: ${JSON.stringify(candidate)} is a host path; the sandbox has it at ${JSON.stringify(virtual)}`
 }

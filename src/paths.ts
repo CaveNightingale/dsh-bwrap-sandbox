@@ -179,6 +179,40 @@ export function hostToVirtual(hostPath: string, mounts: readonly Mount[]): strin
 }
 
 /**
+ * Whether a caller's path is already a name in the visible namespace.
+ *
+ * The harness spells paths the way the execution world does, so an agent
+ * session working under `/workspace` passes `/workspace/...` everywhere. A path
+ * that names no visible root is either a host path or a name this deployment
+ * does not have; `mapPath` refuses both, and only the first is worth a message
+ * of its own.
+ *
+ * @param path - an absolute path a caller supplied.
+ * @param mounts - the mounts in effect for this call.
+ * @returns true when `path` is a visible root or lies beneath one.
+ */
+export function isVirtualPath(path: string, mounts: readonly Mount[]): boolean {
+  return mounts.some(mount => isUnder(path, mount.virtual))
+}
+
+/**
+ * The virtual root a host path stands for, when the deployment declared it.
+ *
+ * The match is the mount root itself and never a path beneath it: the string
+ * that maps is the one an operator wrote into the mount table, so a deployment's
+ * own directory can anchor a relative resolution or a shell's start directory
+ * without any host path being nameable.
+ *
+ * @param hostPath - an absolute path a caller supplied.
+ * @param mounts - the mounts in effect for this call.
+ * @returns the mount's virtual root, or `undefined` when no mount is rooted there.
+ */
+export function declaredRootFor(hostPath: string, mounts: readonly Mount[]): string | undefined {
+  const target = trimSeparator(hostPath)
+  return mounts.find(mount => trimSeparator(mount.host) === target)?.virtual
+}
+
+/**
  * Map an absolute virtual path onto the host filesystem, deciding as it goes
  * whether the caller may name it at all.
  *

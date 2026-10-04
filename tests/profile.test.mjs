@@ -150,12 +150,14 @@ test('a profile bubblewrap refuses fails closed with bubblewrap\u2019s own diagn
   }
   await withProfile(async ({ config }) => {
     const context = new Context()
-    const provider = new BwrapSandboxProvider(context, config)
+    // The policy spells the workspace the way the execution world does; this
+    // row's own config holds the host directory, and here it does not exist.
+    const provider = new BwrapSandboxProvider(context, { ...config, workspace: '/var/tmp/bwrap-missing-workspace' })
     // The profile binds the session workspace, so a workspace that does not exist
     // is the failure this message has to name rather than swallow: without it an
     // unrunnable host and a malformed profile read the same.
     await assert.rejects(
-      provider.confine(['true'], { mode: 'workspace-write', workspaceRoot: '/var/tmp/bwrap-missing-workspace' }),
+      provider.confine(['true'], { mode: 'workspace-write', workspaceRoot: '/workspace' }),
       error => {
         assert.match(error.message, /Runner failure: .*Can.t find source path/)
         return true
@@ -168,6 +170,25 @@ test('a profile bubblewrap refuses fails closed with bubblewrap\u2019s own diagn
     assert.match(logged, /reason: bwrap: Can.t find source path/)
     assert.match(logged, /reproduce: bwrap --ro-bind \/usr \/usr/)
     assert.match(logged, /--bind \/var\/tmp\/bwrap-missing-workspace \/workspace/)
+  })
+})
+
+test('a policy naming another workspace root fails closed', async t => {
+  if (spawnSync('bwrap', ['--version']).status !== 0) {
+    t.skip('bwrap is not installed on this host')
+    return
+  }
+  await withProfile(async ({ config }) => {
+    const provider = new BwrapSandboxProvider(new Context(), config)
+    // Confining against a directory the policy did not name would enforce the
+    // wrong workspace, so the provider refuses instead of guessing.
+    await assert.rejects(
+      provider.confine(['true'], { mode: 'workspace-write', workspaceRoot: '/somewhere/else' }),
+      error => {
+        assert.match(error.message, /names workspace root "\/somewhere\/else"/)
+        return true
+      },
+    )
   })
 })
 

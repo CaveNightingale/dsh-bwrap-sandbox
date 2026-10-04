@@ -32,6 +32,7 @@ function fixture(extraRoots = [], overrides = {}) {
 
   const settings = {
     cwd: workspace,
+    workspace,
     diffBasisMaxBytes: 10 * 1024 * 1024,
     sessionsRoot: '',
     attachmentsRoot: '',
@@ -76,15 +77,21 @@ async function withFixture(extraRoots, body, overrides = {}) {
   }
 }
 
-test('a virtual path, a host path, and a relative path all resolve to the virtual view', async () => {
+test('a virtual path and a relative path resolve to the virtual view, and a host path is refused', async () => {
   await withFixture([], async ({ workspace, backend }) => {
-    for (const path of ['/workspace/src/a.txt', join(workspace, 'src', 'a.txt'), 'src/a.txt']) {
+    for (const path of ['/workspace/src/a.txt', 'src/a.txt']) {
       const target = await backend.resolve(path)
       assert.equal(target.displayPath, '/workspace/src/a.txt')
       assert.equal(target.targetKey, join(workspace, 'src', 'a.txt'))
     }
     // A path that does not exist yet still resolves, so a new write can be checked.
     assert.equal((await backend.resolve('/workspace/src/new.txt')).displayPath, '/workspace/src/new.txt')
+    // A host path is not a name here, even when a mount covers the same file:
+    // the execution world has one spelling, and `processPath` reports it.
+    await assert.rejects(backend.resolve(join(workspace, 'src', 'a.txt')), error => {
+      assert.equal(error.code, 'FS_NOT_FOUND')
+      return true
+    })
   })
 })
 
@@ -131,16 +138,21 @@ test('paths out of the mount namespace read as absent to both fences', async () 
   })
 })
 
-test('the user-level agents home and DSH skill root are reachable in both spellings', async () => {
+test('the user-level agents home and DSH skill root are reachable under their virtual names', async () => {
   await withFixture([], async ({ root, backend, guard, call }) => {
     const hostSkill = join(root, 'agents', 'skills', 'demo', 'SKILL.md')
     assert.equal((await backend.resolve('/agents/skills/demo/SKILL.md')).targetKey, hostSkill)
-    // The loader hands over host paths, so the mount has to answer in both.
-    assert.equal((await backend.resolve(hostSkill)).displayPath, '/agents/skills/demo/SKILL.md')
     assert.equal((await backend.resolve('/skills/local/SKILL.md')).displayPath, '/skills/local/SKILL.md')
+    // The loader reaches them the same way, because the cwd it joins against is
+    // the execution world's spelling rather than the host directory.
+    await assert.rejects(backend.resolve(hostSkill), error => {
+      assert.equal(error.code, 'FS_NOT_FOUND')
+      return true
+    })
 
     assert.equal(guard(call('read', { file_path: '/agents/skills/demo/SKILL.md' })), undefined)
     assert.equal(guard(call('read', { file_path: '/skills/local/SKILL.md' })), undefined)
+    assert.match(guard(call('read', { file_path: hostSkill })), /is a host path/)
   })
 })
 
@@ -157,16 +169,39 @@ test('the user-global instruction file reads as absent until it exists', async (
 
     const present = await backend.resolve('/AGENTS.md')
     assert.equal(present.targetKey, join(root, 'AGENTS.md'))
-    assert.equal((await backend.resolve(join(root, 'AGENTS.md'))).displayPath, '/AGENTS.md')
     assert.equal((await backend.stat(present)).type, 'file')
     assert.equal(guard(call('read', { file_path: '/AGENTS.md' })), undefined)
+    // Its host spelling is not a name this session has.
+    assert.match(guard(call('read', { file_path: join(root, 'AGENTS.md') })), /is a host path/)
+  })
+})
+
+test('a directory listing reports every child under its virtual name', async () => {
+  await withFixture([], async ({ workspace, backend }) => {
+    const root = await backend.resolve('/workspace')
+    const entries = await backend.listDir(root)
+    const byName = Object.fromEntries(entries.map(entry => [entry.name, entry.target.displayPath]))
+    assert.equal(byName.src, '/workspace/src')
+    // `str_replace_editor` prints these paths verbatim, so a host spelling here
+    // would be the one host path the model reads without naming one itself.
+    for (const path of Object.values(byName)) {
+      assert.match(path, /^\/workspace\//)
+      assert.ok(!path.includes(workspace), `${path} names no host directory`)
+    }
+    // The link out of the workspace is not listed: its target would take a
+    // follow-up operation outside the fence, and `read` refuses it anyway.
+    assert.equal('escape' in byName, false)
+
+    const children = await backend.listDir(await backend.resolve('/workspace/src'))
+    assert.deepEqual(children.map(entry => entry.target.displayPath), ['/workspace/src/a.txt'])
   })
 })
 
 test('the read-only stores stay reachable and workspace calls stay allowed', async () => {
   await withFixture([], async ({ backend, guard, call }) => {
-    const target = await backend.resolve(join(process.env.HOME, '.dsh', 'sessions'))
+    const target = await backend.resolve('/sessions')
     assert.equal(target.displayPath, '/sessions')
+    assert.ok(target.targetKey.endsWith(join('.dsh', 'sessions')))
     assert.equal(guard(call('read', { file_path: '/workspace/src/a.txt' })), undefined)
     assert.equal(guard(call('present', { files: [{ path: '/workspace/src/a.txt' }] })), undefined)
   })

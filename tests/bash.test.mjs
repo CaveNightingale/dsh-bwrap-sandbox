@@ -25,12 +25,19 @@ function mounts() {
 test('the requested directory maps through the mount table', () => {
   const fixture = mounts()
   try {
-    // A host path, which is what the tool layer resolves a relative workdir to.
-    assert.equal(workdirArgument(join(fixture.workspace, 'src'), fixture.mounts), '/workspace/src')
+    // The deployment's own root is the one host string that still maps: a
+    // session recorded before the namespace existed asks for its workspace.
     assert.equal(workdirArgument(fixture.workspace, fixture.mounts), '/workspace')
-    // The virtual spelling, which is how the model names every other path.
+    // The virtual spelling is how the tool layer and the model name paths.
     assert.equal(workdirArgument('/workspace/src', fixture.mounts), '/workspace/src')
     assert.equal(workdirArgument(VIRTUAL_SPILL, fixture.mounts), VIRTUAL_SPILL)
+    // A host path beneath that root is not a name here, so it cannot start a
+    // command: the request has one spelling, the one the sandbox shows.
+    assert.throws(
+      () => workdirArgument(join(fixture.workspace, 'src'), fixture.mounts),
+      PathDeniedError,
+      'a host subpath is refused',
+    )
   } finally {
     rmSync(fixture.root, { recursive: true, force: true })
   }

@@ -3,10 +3,12 @@
 Bubblewrap confinement and workspace-fenced file tools for DeepSeek Harness.
 
 Every confined process sees the session workspace as `/workspace` and every home
-directory as an empty, ephemeral directory. The model never receives a host path:
-file tools report `/workspace/...`, the shell's `pwd` is `/workspace`, spilled
-tool output is addressed as `/spill/...`, and the environment names that would
-carry a host path are dropped.
+directory as an empty, ephemeral directory. The session's own working directory
+is `/workspace` too — the harness asks the filesystem provider how its execution
+world spells a path — so the model never receives a host path and cannot name
+one: file tools report `/workspace/...`, the shell's `pwd` is `/workspace`,
+spilled tool output is addressed as `/spill/...`, a host-spelled tool argument is
+refused, and the environment names that would carry a host path are dropped.
 
 ### Warning
 This plugin is mostly AI-generated and may not cover all edge cases accurately. Codes are under manual review but it's possible to encounter unexpected behavior. Use with caution. For later agents participating in the development, please mind hallucinations left by previous AI outputs. Please claim AI usage in the git commit messages.
@@ -24,7 +26,14 @@ replace and inserts these:
 | `guard-bwrap` | `ctx.tools.guard()` | — | the tools its configured table names |
 | `spill-bwrap` | `ctx.spillStore` | `dsh-spill-local` | oversized tool results, for `bash`, `grep`, and every other result the policy retains |
 
-`sandbox-policy` stays mounted: it owns the per-session mode and workspace root.
+`sandbox-policy` stays mounted: it owns the per-session mode and workspace root,
+and the bundle restates the root in the execution world's spelling. It is not a
+row this bundle replaces.
+
+The patch also disables `tool-fs-search`, so the session has no `grep` and no
+`glob`: both spawn the packaged ripgrep on the harness host and hand it the
+model's path, which names a directory that exists only inside the sandbox. See
+[why it cannot be fixed from here](#search-tools-are-disabled).
 Retention itself stays with `dsh-spill-policy` and `dsh-output-retention`, which
 reach this backend through the one-method `ctx.spillStore` seam.
 
@@ -97,12 +106,37 @@ check to forget:
 What the model is shown is the canonical virtual path: `/workspace/a/../b`,
 `/workspace/link/b`, and `/workspace/b` all report `/workspace/b`.
 
-A host path handed in by the harness is converted through the mount table when a
-mount covers it, and otherwise read as a virtual path — which can only succeed
-if it names a mount. The rule covers every path-taking tool: `ctx.fs.resolve`
-fences `read`, `read_image`, `write`, `edit`, `str_replace_editor`, and
-`present`, while `guard-bwrap` applies the same walk to `grep`, `glob`, and
-`lsp`, which do not resolve through `ctx.fs`.
+The namespace has one spelling, and no host path is a name in it. A session's
+working directory is the one the filesystem provider reports through
+`processPath` — `/workspace` here — so the harness itself spells paths the way
+the sandbox does: the persona's `{{cwd}}`, the runtime-context policy line, the
+instruction loaders, the skill loaders, and every tool argument. A host path in
+a **tool argument** is refused outright, naming the path the sandbox shows:
+
+```text
+read file_path=/home/deepseek/workspace/notes.md
+→ path boundary: "/home/deepseek/workspace/notes.md" is a host path; the sandbox has it at "/workspace/notes.md"
+```
+
+`ctx.fs.resolve` and `ctx.fs.lstat` fence `read`, `read_image`, `write`, `edit`,
+`str_replace_editor`, and `present`; `guard-bwrap` applies the same walk and the
+host-spelling rule to `grep`, `glob`, and `lsp`, which do not resolve through
+`ctx.fs`, and to the directory argument of `bash`, `pwsh`, and `terminal`, whose
+providers would otherwise absorb a host spelling.
+
+The one host string still honored is a **mount root**: the deployment's own
+directory, written in configuration, which anchors a relative path for a session
+recorded before the namespace existed. Nothing beneath such a root is a name,
+and a path under no root is `not found` like any other path the sandbox does not
+have.
+
+A directory listing is part of the same rule. `listDir` reports every child as
+`<listed directory>/<name>` — the spelling a caller can pass back to any other
+method — instead of the host path the local backend resolves for it, because
+`str_replace_editor`'s directory view prints those paths verbatim. A child whose
+resolved target lies outside every mount is omitted rather than listed with an
+unresolvable target, since that target re-enters the backend for follow-up
+operations.
 
 Because the tools read symlink targets the way the sandbox does, the two views
 of the workspace agree link for link:
@@ -134,6 +168,28 @@ A PTY driven through this profile was measured against the stock provider's:
 | `tty` (`ttyname`) | `/dev/console` | `/dev/console` |
 | `ls /dev/pts` | `ptmx` | `ptmx` |
 | `pwd` | the host workspace path | `/workspace` |
+
+### Search tools are disabled
+
+`grep` and `glob` come from `dsh-tool-fs-search`, which spawns the packaged
+ripgrep **on the harness host** and passes the model's path to it unchanged. That
+makes the host its execution world while this bundle's is the sandbox, and no
+path satisfies both: the model knows only `/workspace/...`, which the host does
+not have, and the tool's default workdir is the session cwd — `/workspace` here
+as well — so even a call with no path fails. The guard still fences their
+argument, so no host path leaks; the search simply cannot run.
+
+Nothing in this bundle can fix that, because the argument never passes through a
+point a plugin owns: it goes straight into the tool's own subprocess. The patch
+therefore disables the `tool-fs-search` row, which removes both tools from the
+model's tool list instead of offering two that always fail. `bash` searches the
+same tree from inside the sandbox, where the path it is given exists.
+
+Restoring them means making them run ripgrep inside the sandbox: spawn it
+through `ctx.shell` (or confine `ctx.subprocess`), bind the ripgrep binary into
+the profile, and resolve the model's path with `ctx.fs.processPath` — the seam's
+answer for "a path a subprocess in this execution world can open". That is a
+change in the harness packages, not here.
 
 ### A shell's `workdir`
 
@@ -219,6 +275,35 @@ those inputs are silently invisible — the loaders catch the error and report n
 skills or no user-global instructions rather than failing. `/AGENTS.md` is one
 file, not `$DSH_HOME`: that directory also holds credentials.
 
+The bundle therefore configures both loader rows with **namespace spellings**,
+not host directories, because a host directory is not a name this session has:
+
+```yaml
+- id: agent-instructions
+  config:
+    maxBytes: 65536
+    projectRootMarkers: []
+    dshHome: /          # so the user-global file it joins is /AGENTS.md
+
+- id: skill-filesystem
+  config:
+    dshHome: /          # so its user-dsh root is /skills
+    agentsHome: /agents # so its user-agents root is /agents/skills
+```
+
+Both loaders join their configured root with a name and then join each child
+they list onto that root, so the root has to be a namespace path for the
+children to be too. Both report nothing when a path resolves to nothing: a host
+root here shows up as an empty skill catalog and a missing user-global
+instruction block, never as an error.
+
+The same rule reaches `sandbox-policy`, whose contract spells its fallback root
+in the execution world ("preserve execution-world spelling; enforcing providers
+resolve filesystem identity on their host"). The bundle restates that root as
+`/workspace`, so the policy line the model reads names the virtual workspace
+rather than the deployment's home directory. Agent sessions resolve their own
+cwd, which `fs-bwrap` already reports as `/workspace`.
+
 `--chdir` re-anchors the child. The caller spawns with its own cwd — the host
 workspace path, applied before bubblewrap builds the namespace — so without it
 the child would start in a directory that does not exist inside.
@@ -231,6 +316,7 @@ the child would start in a directory that does not exist inside.
   config:
     systemReadOnlyRoots: ['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc', '/opt']
     maskedRoots: ['/home', '/root']
+    workspace: ''             # default: the process working directory
     sessionsRoot: ''          # default: $DSH_HOME/sessions
     attachmentsRoot: ''       # default: $DSH_HOME/attachments
     spillRoot: ''             # default: $DSH_HOME/spill
@@ -246,6 +332,7 @@ the child would start in a directory that does not exist inside.
 |---|---|---|
 | `systemReadOnlyRoots` | `/usr`, `/lib`, `/lib64`, `/bin`, `/sbin`, `/etc`, `/opt` | Host directories bound read-only under their own path. A host that needs another root (`/nix`, `/snap`, a toolchain prefix) adds it here; a missing entry makes commands that touch it fail. |
 | `maskedRoots` | `/home`, `/root` | Directories replaced by an empty tmpfs. Writable but ephemeral: no host data is readable and nothing survives the process. |
+| `workspace` | the process working directory | Host workspace directory bound at `/workspace`. The harness spells the workspace the way the execution world does, so the policy this row receives names `/workspace`; a policy naming any other root fails closed rather than confining against the wrong directory. |
 | `sessionsRoot` | `$DSH_HOME/sessions` | Host session-log directory, exposed read-only at `/sessions`. Set to a non-empty value to override; the empty default resolves `$DSH_HOME`. |
 | `attachmentsRoot` | `$DSH_HOME/attachments` | Host attachment store, exposed read-only at `/attachments`. |
 | `spillRoot` | `$DSH_HOME/spill` | Host spill directory, exposed read-only at `/spill`. Must match the `spillRoot` of the other rows. |
@@ -257,19 +344,19 @@ the child would start in a directory that does not exist inside.
 | `dropEnv` | `DSH_HOME`, `DSH_PROFILE_DIR` | Environment names removed from every confined process, because their values name host paths. |
 
 `fs-bwrap` takes the local backend's own config (`cwd`, `diffBasisMaxBytes`) plus
-the mount fields below. `guard-bwrap` takes the same ones, and `spill-bwrap`
-takes `spillRoot`, which must match theirs. They are separate plugins with
-separate configs, so a value set on one has no effect on the others. A
-`spillRoot` that disagrees is the sharpest case: `spill-bwrap` builds a
+the mount fields below; its `cwd` is the host workspace directory the mount table
+anchors at, and `processPath` reports that directory as `/workspace`.
+`guard-bwrap` takes the same mount fields plus `workspace`, its host anchor, and
+`spill-bwrap` takes `spillRoot`, which must match theirs. They are separate
+plugins with separate configs, so a value set on one has no effect on the others.
+A `spillRoot` that disagrees is the sharpest case: `spill-bwrap` builds a
 `/spill/...` locator for one host directory and the other rows resolve it to
 another. The same hazard applies to `agentsHome`, `skillsRoot`, and
-`userInstructionsFile`, whose defaults follow another plugin's configuration:
-`skill-filesystem` reads user skills from `<its dshHome>/skills` and
-`<its agentsHome>/skills`, and `agent-instructions` reads
-`<its dshHome>/AGENTS.md`, through `ctx.fs`. A loader pointed at a directory no
-mount covers finds nothing and reports nothing — it catches the unresolvable
-path and answers "no skills", or "no user-global instructions" — so a mismatch
-here is invisible until someone notices what is missing from the prompt.
+`userInstructionsFile`, whose mount sources the loader rows read through
+`ctx.fs` and whose configured roots are the namespace spellings above — a host
+spelling in either place is invisible: the loader catches the unresolvable path
+and answers "no skills" or "no user-global instructions", so a mismatch here
+surfaces as something missing from the prompt rather than as an error.
 
 ```yaml
 - id: fs-bwrap
@@ -287,6 +374,7 @@ here is invisible until someone notices what is missing from the prompt.
 - id: guard-bwrap
   name: 'dsh-bwrap-sandbox/guard'
   config:
+    workspace: ''                 # keep identical to the bwrap-sandbox row
     sessionsRoot: ''              # keep identical to the fs-bwrap row
     attachmentsRoot: ''           # keep identical to the fs-bwrap row
     spillRoot: ''                 # keep identical to the fs-bwrap row
@@ -305,6 +393,7 @@ here is invisible until someone notices what is missing from the prompt.
 
 | Field | Default | Meaning |
 |---|---|---|
+| `workspace` | the process working directory | Host directory the guard's mount table anchors at. It reads this instead of the session cwd, which is an execution-world path. |
 | `sessionsRoot` | `$DSH_HOME/sessions` | Host session-log directory, exposed read-only at `/sessions`. |
 | `attachmentsRoot` | `$DSH_HOME/attachments` | Host attachment store, exposed read-only at `/attachments`. |
 | `spillRoot` | `$DSH_HOME/spill` | Host directory the artifacts are written to and read from, exposed read-only at `/spill`. |
@@ -331,6 +420,9 @@ by deployment:
       grep: path
       glob: path
       lsp: file_path
+      bash: workdir
+      pwsh: workdir
+      terminal: cwd
       notebook_edit: file_path    # a tool this deployment adds
     pathArrayArguments:           # tool → the argument holding `{ path }` entries
       present: files
@@ -338,7 +430,8 @@ by deployment:
 
 | Field | Default | Meaning |
 |---|---|---|
-| `pathArguments` | the eight shipped entries: `read`, `read_image`, `write`, `edit`, `str_replace_editor` → `file_path`/`path`, `grep` and `glob` → `path`, `lsp` → `file_path` | Tools taking one path. || `pathArrayArguments` | `present` → `files` | Tools taking a list of `{ path }` entries. |
+| `pathArguments` | the eleven shipped entries: `read`, `read_image`, `write`, `edit` → `file_path`, `str_replace_editor`, `grep`, `glob` → `path`, `lsp` → `file_path`, `bash` and `pwsh` → `workdir`, `terminal` → `cwd` | Tools taking one path. |
+| `pathArrayArguments` | `present` → `files` | Tools taking a list of `{ path }` entries. |
 
 The value is the **whole table**, not an overlay: the shipped table is the field's
 default, so omitting the field keeps it and setting the field replaces it.
@@ -361,6 +454,9 @@ than relying on the plugin's default to show them:
       grep: path
       glob: path
       lsp: file_path
+      bash: workdir
+      pwsh: workdir
+      terminal: cwd
     pathArrayArguments:
       present: files
 ```
@@ -387,9 +483,13 @@ dsh --profile <name> --dump-config-schema | jq '.$defs[] | select(.anyOf[0].prop
 
 The consequence is worth stating plainly. A tool left out of `pathArguments` is a
 tool the guard does not inspect, so writing one entry with the intent of *adding*
-a tool instead replaces all eight — and `grep`, `glob`, and `lsp` stop being
-fenced. Those three are the ones only this plugin covers; the rest are also
-fenced by `fs-bwrap`, which this field does not affect.
+a tool instead replaces all eleven — and `grep`, `glob`, and `lsp` stop being
+fenced. Those three are the ones only this plugin covers; `read`, `read_image`,
+`write`, `edit`, `str_replace_editor`, and `present` are also fenced by
+`fs-bwrap`, which this field does not affect. `bash` and `pwsh` keep their
+`workdir` resolved by the shell provider either way, and `terminal`'s `cwd` by
+its own provider, so removing their entries stops the host-spelling refusal
+without unconfining anything.
 
 A blank tool name, a blank argument, or one tool in both tables fails at load. A
 wrong argument name cannot be caught, and means the call carries nothing to
@@ -467,20 +567,23 @@ last through `dsh plugin` does that.
 
 ## Verification
 
-Unit tests (`npm test`) pin the profile ordering and the mapping: a virtual, a
-host, and a relative path reaching the same file; an alias outside the mounts
-reading as absent; a link to `/etc` and a link holding a host path both reading
-as absent; a link
+Unit tests (`npm test`) pin the profile ordering and the mapping: a virtual and a
+relative path reaching the same file while its host spelling is `FS_NOT_FOUND`; an
+alias outside the mounts reading as absent; a link to `/etc` and a link holding a
+host path both reading as absent; a link
 holding `/workspace/...` and a relative link both followed; `/workspace/../etc/passwd`
 reading as absent; `..` after a symlink landing at the target's parent; a symlink loop
 refused by the mapping; an extra root reached under its own name only; the
-user-level agents home, skill root, and instruction file reachable in both
-spellings; and a bind source that does not exist skipped rather than fatal. Three
-of them run the real `@deepseek-ai/dsh-agent-instructions` loader against the
-real backend: root discovery completes past an ancestor that has both a `.git`
-and its own `AGENTS.md`, that ancestor's instructions do not load, and a missing
-user-global file is not an error. Reverting the backend's `FS_NOT_FOUND` to a
-denial fails all three with the original `cannot access ".../.git"` abort. The profile itself was
+user-level agents home, skill root, and instruction file reachable under their
+virtual names and refused under their host ones; a workdir that maps only when it
+IS the configured root; and a bind source that does not exist skipped rather than
+fatal. Four of them run the real
+`@deepseek-ai/dsh-agent-instructions` loader against the real backend: root
+discovery completes past an ancestor that has both a `.git` and its own
+`AGENTS.md`, that ancestor's instructions do not load, the user-global file loads
+from `/AGENTS.md`, and a missing user-global file is not an error. Reverting the
+backend's `FS_NOT_FOUND` to a denial fails all of them with the original
+`cannot access ".../.git"` abort. The profile itself was
 exercised end-to-end against real bubblewrap: under `workspace-write`, `/home`
 lists empty, `~/.bashrc` fails with `ENOENT`, the workspace reads and writes,
 `/usr` writes report `read-only file system`, `/sessions` lists the real session
@@ -495,7 +598,19 @@ the same bytes, and a write through it reported `read-only file system`. The
 guard's argument tables are covered from both ends: the merge is asserted
 against the shipped tables, and each of adding, overriding, and removing a tool
 is exercised through a real registered guard.
+A refused path is silent by design — it reads as `not found` — so the fence can
+print what it refused and who named it. Setting `BWRAP_TRACE=1` writes one block
+per refusal to stderr, with the first frames that reached the fence:
 
+```sh
+BWRAP_TRACE=1 dsh --profile <name> "task"
+```
+
+That is how the current wiring was checked: a whole session — skills, both
+instruction files, the policy line, a confined `bash` call — produced exactly one
+refusal, `/.git` from `skill-filesystem`'s upward project-root walk, which is a
+virtual path at the namespace root and the walk's expected termination. No host
+path reached `ctx.fs`.
 ## Known limitations
 
 - **Linux only, and fail-closed.** Bubblewrap is the sole backend. On another
@@ -558,8 +673,23 @@ is exercised through a real registered guard.
   address a directory the others resolve elsewhere, which fails as a missing file
   rather than as a denial. The loaders that read through these mounts
   (`skill-filesystem.dshHome`/`agentsHome`, `agent-instructions.dshHome`) must
-  name the same hosts, and their failure is silent: an unresolvable path reads as
-  an empty skills catalog or an absent user-global instruction file.
+  name the same tree — the loader rows in namespace spellings (`/`, `/agents`),
+  the mount rows in host directories — and their failure is silent: an
+  unresolvable path reads as an empty skills catalog or an absent user-global
+  instruction file.
+- **A directory listing omits children the fence cannot name.** A link pointing
+  out of the workspace, and a target that vanished between the listing and its
+  resolution, appear in `bash` (`ls` shows the entry) but not in a tool listing.
+  The alternative — listing the entry with the host target it resolved to —
+  would let a follow-up operation on that target leave the fence. A link whose
+  target stays inside the namespace is listed under its own name and reads
+  normally.
+- **The guard fences calls that carry no agent session.** Its mount table is
+  anchored at the deployment's configured workspace rather than at a session, so
+  an agentless call is checked the same way. Those calls used to be deferred to
+  the filesystem backend, which cannot see `grep`, `glob`, `lsp`, `bash`,
+  `pwsh`, or `terminal` — the tools only this guard covers — and a host path must
+  not be nameable there either.
 - **`writableRoots` must list the same mounts on `bwrap-sandbox` and
   `fs-bwrap`.** They are separate plugins and nothing checks the agreement. A
   mount writable only in the profile fails at the tool fence, one writable only
@@ -599,12 +729,36 @@ is exercised through a real registered guard.
 direction — the tools learn about a tree the sandbox already cannot reach —
   but it means the two views of the filesystem differ, and binding `/tmp`
   there would also override its private-tmp mask.
-- **The real workspace path is still disclosed by `sandbox-policy`.** Its
-  runtime-context snapshot names the recorded session workspace. Suppressing it
-  wholesale (`ctx.systemPrompt.suppressRuntimeContext()`) would also drop the
-  approval and delegation contexts, so this package leaves it alone; the leak
-  disappears only if that contribution stops naming the root.
+- **The session cwd is `/workspace`, which moves the session log and breaks
+  resume of sessions recorded before it.** The headless runner takes the session
+  cwd from `fs.processPath`, so sessions are keyed under
+  `$DSH_HOME/sessions/--workspace--/` instead of a directory named after the host
+  project, and a session recorded earlier carries the host path in its header.
+  Resuming one of those under the headless runner fails loudly — it compares the
+  recorded cwd with the one it computed — and its stored files are in the older
+  directory. The fences still accept a session whose root IS the configured
+  workspace, so such a session runs; it just cannot be adopted by the runner.
+- **Harness components that treat the session cwd as a host path see
+  `/workspace`.** The contract says the cwd is an execution-world path, and the
+  sandboxed consumers want it that way: a PTY's start directory, a PTC child's
+  cwd, and `sandbox-policy`'s policy line all become `/workspace`, which is what
+  exists inside. A consumer that reaches the host instead — revealing a
+  deliverable in the desktop's file manager, a Windows-ACL sandbox that resolves
+  identity on its host — will not find that directory. Those are outside this
+  bundle's rows.
+- **`grep` and `glob` are disabled.** They spawn the packaged ripgrep on the
+  harness host and hand it the model's path, so the two worlds cannot agree: the
+  model knows only `/workspace/...`, which the host does not have, and the tool's
+  default workdir is the session cwd, which is `/workspace` too. The guard still
+  fences their argument, so nothing leaks, but a search cannot run — and no
+  bundle row can rewrite an argument a tool passes to its own subprocess. The
+  patch disables the row rather than leaving two tools that always fail. Search
+  inside the sandbox instead (`bash` with `rg`/`grep`), or restore the tools by
+  making them run ripgrep through the sandbox: spawn it under `ctx.shell` (or
+  confine `ctx.subprocess`) and resolve the path with `ctx.fs.processPath`, which
+  is the seam's answer for "a path a subprocess in this execution world can
+  open". That is a change in the harness packages, not here.
 - **A user interface that opens files must translate `/workspace/...` back.**
-  The client already knows the session's real cwd, so the mapping is mechanical,
-  but a card that feeds the displayed path straight to a file opener will not
-  find it.
+  The client knows the session's real cwd from its own launcher, so the mapping
+  is mechanical, but a card that feeds the displayed path straight to a file
+  opener will not find it.

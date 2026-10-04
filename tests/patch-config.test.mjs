@@ -44,3 +44,15 @@ test('a missing or reordered marker is reported rather than silently rewriting',
   assert.throws(() => replaceRegion('- id: x\n', 'anything'), /missing the generated region/)
   assert.equal(typeof PATCH_PATH, 'string')
 })
+
+test('the patch disables the rows whose execution world is the host', () => {
+  const { text } = readPatch()
+  // A `disabled: true` here is a composition decision, not an implementation
+  // detail: each of these spawns or binds on the harness host, and a tool whose
+  // subprocess never sees the namespace cannot be repaired by a config value.
+  for (const id of ['sandbox', 'bash-sandbox', 'fs-sandbox', 'spill-local', 'tool-fs-search']) {
+    assert.ok(text.includes(`- id: ${id}\n  disabled: true`), `${id} is disabled`)
+  }
+  // The search tools are the only disabled row that removes model-visible tools.
+  assert.ok(text.includes('- id: tool-fs-search\n  disabled: true'), 'the search row is disabled')
+})
