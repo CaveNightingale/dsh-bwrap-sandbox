@@ -73,7 +73,7 @@ test('the default table fences the shipped tools', () => {
     ['lsp', { file_path: '/etc/passwd' }],
     ['present', { files: [{ path: '/etc/passwd' }] }],
   ]) {
-    assert.match(guard(call(name, args)), /path boundary/, `${name} is fenced by default`)
+    assert.match(guard(call(name, args)), /not found/, `${name} is fenced by default`)
   }
   assert.equal(guard(call('grep', { path: '/workspace/src' })), undefined)
   assert.equal(guard(call('present', { files: [{ path: '/workspace/a.txt' }] })), undefined)
@@ -89,14 +89,14 @@ test('an empty table covers nothing, and a replaced table covers exactly itself'
   assert.equal(emptied(call('present', { files: [{ path: '/etc/passwd' }] })), undefined)
 
   const one = guardFor({ pathArguments: { notebook_edit: 'file_path' }, pathArrayArguments: {} })
-  assert.match(one(call('notebook_edit', { file_path: '/etc/passwd' })), /path boundary/)
+  assert.match(one(call('notebook_edit', { file_path: '/etc/passwd' })), /not found/)
   assert.equal(one(call('notebook_edit', { file_path: '/workspace/a.md' })), undefined)
   assert.equal(one(call('grep', { path: '/etc' })), undefined, 'grep is not in the replaced table')
 })
 
 test('a configured array tool is read from the argument the table names', () => {
   const guards = guardFor({ pathArguments: {}, pathArrayArguments: { attach: 'files' } })
-  assert.match(guards(call('attach', { files: [{ path: '/etc/passwd' }] })), /path boundary/)
+  assert.match(guards(call('attach', { files: [{ path: '/etc/passwd' }] })), /not found/)
   assert.equal(guards(call('attach', { files: [{ path: '/workspace/a.txt' }] })), undefined)
   // Naming the wrong argument means the call carries nothing to inspect, so a
   // misconfigured entry fences nothing.

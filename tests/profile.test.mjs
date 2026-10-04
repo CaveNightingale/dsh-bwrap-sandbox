@@ -1,19 +1,43 @@
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import assert from 'node:assert/strict'
 import test from 'node:test'
 import { profileArgs } from '../lib/sandbox.js'
 
-/** The resolved mount profile the provider builds from a validated config. */
-const config = {
-  systemReadOnlyRoots: ['/usr', '/lib', '/etc'],
-  maskedRoots: ['/home', '/root'],
-  sessionsRoot: '/home/dev/.dsh/sessions',
-  attachmentsRoot: '/home/dev/.dsh/attachments',
-  spillRoot: '/home/dev/.dsh/spill',
-  privateTmp: true,
-  dropEnv: ['DSH_HOME', 'DSH_PROFILE_DIR'],
-}
+/**
+ * Build a tree holding every bind source plus the resolved profile config that
+ * names it, run `body`, then clean the tree up.
+ * @param body - receives the config, one policy, and the tree paths.
+ */
+function withProfile(body) {
+  const root = mkdtempSync(join(tmpdir(), 'bwrap-profile-'))
+  const dsh = join(root, 'dsh')
+  for (const name of ['sessions', 'attachments', 'spill', 'skills']) mkdirSync(join(dsh, name), { recursive: true })
+  mkdirSync(join(root, 'agents'), { recursive: true })
+  writeFileSync(join(dsh, 'AGENTS.md'), 'user-global rules\n')
+  const workspace = join(root, 'project')
+  mkdirSync(workspace)
 
-const policy = { mode: 'workspace-write', workspaceRoot: '/home/dev/project' }
+  const config = {
+    systemReadOnlyRoots: ['/usr', '/lib', '/etc'],
+    maskedRoots: ['/home', '/root'],
+    sessionsRoot: join(dsh, 'sessions'),
+    attachmentsRoot: join(dsh, 'attachments'),
+    spillRoot: join(dsh, 'spill'),
+    agentsHome: join(root, 'agents'),
+    skillsRoot: join(dsh, 'skills'),
+    userInstructionsFile: join(dsh, 'AGENTS.md'),
+    privateTmp: true,
+    writableRoots: [],
+    dropEnv: ['DSH_HOME', 'DSH_PROFILE_DIR'],
+  }
+  try {
+    body({ config, policy: { mode: 'workspace-write', workspaceRoot: workspace }, root, dsh, workspace })
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
 
 /**
  * Index of the first occurrence of a token sequence at or after `from`.
@@ -30,54 +54,101 @@ function indexOfSequence(argv, sequence, from = 0) {
 }
 
 test('masking follows the system binds, and every later mount wins at its path', () => {
-  const argv = profileArgs(policy, config)
-  for (const root of config.systemReadOnlyRoots) {
-    assert.ok(indexOfSequence(argv, ['--ro-bind', root, root]) >= 0, `${root} is bound read-only`)
-  }
-  assert.ok(indexOfSequence(argv, ['--tmpfs', '/lib']) < 0, 'no system root is masked')
+  withProfile(({ config, policy }) => {
+    const argv = profileArgs(policy, config)
+    for (const root of config.systemReadOnlyRoots) {
+      assert.ok(indexOfSequence(argv, ['--ro-bind', root, root]) >= 0, `${root} is bound read-only`)
+    }
+    assert.ok(indexOfSequence(argv, ['--tmpfs', '/lib']) < 0, 'no system root is masked')
 
-  // A later mount replaces an earlier one at the same path, so the masks must
-  // come after the binds they must not be shadowed by.
-  const lastBind = Math.max(...config.systemReadOnlyRoots.map(root => indexOfSequence(argv, ['--ro-bind', root, root])))
-  for (const root of config.maskedRoots) {
-    assert.ok(indexOfSequence(argv, ['--tmpfs', root]) > lastBind, `${root} is masked after the system binds`)
-  }
+    // A later mount replaces an earlier one at the same path, so the masks must
+    // come after the binds they must not be shadowed by.
+    const lastBind = Math.max(...config.systemReadOnlyRoots.map(root => indexOfSequence(argv, ['--ro-bind', root, root])))
+    for (const root of config.maskedRoots) {
+      assert.ok(indexOfSequence(argv, ['--tmpfs', root]) > lastBind, `${root} is masked after the system binds`)
+    }
 
-  // The stores live under a masked home on this host, and bubblewrap resolves a
-  // bind SOURCE in the host namespace, so binding them after the mask is both
-  // sufficient and necessary.
-  const lastMask = Math.max(...config.maskedRoots.map(root => indexOfSequence(argv, ['--tmpfs', root])))
-  assert.ok(indexOfSequence(argv, ['--ro-bind', config.sessionsRoot, '/sessions']) > lastMask)
-  assert.ok(indexOfSequence(argv, ['--ro-bind', config.attachmentsRoot, '/attachments']) > lastMask)
-  assert.ok(indexOfSequence(argv, ['--ro-bind', config.spillRoot, '/spill']) > lastMask)
+    // The stores and the user-level inputs live under a masked home on this host,
+    // and bubblewrap resolves a bind SOURCE in the host namespace, so binding
+    // them after the mask is both sufficient and necessary.
+    const lastMask = Math.max(...config.maskedRoots.map(root => indexOfSequence(argv, ['--tmpfs', root])))
+    const sources = [
+      [config.sessionsRoot, '/sessions'],
+      [config.attachmentsRoot, '/attachments'],
+      [config.spillRoot, '/spill'],
+      [config.agentsHome, '/agents'],
+      [config.skillsRoot, '/skills'],
+      [config.userInstructionsFile, '/AGENTS.md'],
+    ]
+    for (const [source, virtual] of sources) {
+      assert.ok(indexOfSequence(argv, ['--ro-bind', source, virtual]) > lastMask, `${virtual} is bound after the masks`)
+    }
 
-  // `/tmp` is masked before the workspace bind, so a workspace that lives under
-  // it is still reachable.
-  assert.ok(indexOfSequence(argv, ['--tmpfs', '/tmp']) < indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace']))
+    // `/tmp` is masked before the workspace bind, so a workspace that lives under
+    // it is still reachable.
+    assert.ok(indexOfSequence(argv, ['--tmpfs', '/tmp']) < indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace']))
+  })
+})
+
+test('a bind source that does not exist is skipped, not fatal', () => {
+  withProfile(({ config, policy, root }) => {
+    const missing = profileArgs(policy, {
+      ...config,
+      skillsRoot: join(root, 'no-skills'),
+      userInstructionsFile: join(root, 'no-AGENTS.md'),
+    })
+    // Bubblewrap refuses a profile whose bind source is absent, which would take
+    // the whole workspace down; an optional user-global file may simply not exist.
+    assert.ok(indexOfSequence(missing, ['--ro-bind', join(root, 'no-skills'), '/skills']) < 0)
+    assert.ok(indexOfSequence(missing, ['--ro-bind', join(root, 'no-AGENTS.md'), '/AGENTS.md']) < 0)
+    assert.ok(indexOfSequence(missing, ['--ro-bind', config.agentsHome, '/agents']) >= 0)
+    assert.deepEqual(missing.slice(-6), ['--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent'])
+  })
+})
+
+test('a writable mount is bound read-write, and the rest stay read-only', () => {
+  withProfile(({ config, policy }) => {
+    const argv = profileArgs(policy, { ...config, writableRoots: ['/agents'] })
+    assert.ok(indexOfSequence(argv, ['--bind', config.agentsHome, '/agents']) >= 0)
+    assert.ok(indexOfSequence(argv, ['--ro-bind', config.agentsHome, '/agents']) < 0)
+    for (const [source, virtual] of [
+      [config.skillsRoot, '/skills'],
+      [config.userInstructionsFile, '/AGENTS.md'],
+      [config.spillRoot, '/spill'],
+    ]) {
+      assert.ok(indexOfSequence(argv, ['--ro-bind', source, virtual]) >= 0, `${virtual} stays read-only`)
+    }
+    // The workspace keeps the mode-dependent bind, which is not a writable root.
+    assert.ok(indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace']) >= 0)
+  })
 })
 
 test('the workspace is bound last, then the child is re-anchored', () => {
-  const argv = profileArgs(policy, config)
-  const workspace = indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace'])
-  assert.ok(workspace >= 0)
-  assert.ok(indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace'], workspace + 1) < 0, 'bound once')
+  withProfile(({ config, policy }) => {
+    const argv = profileArgs(policy, config)
+    const workspace = indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace'])
+    assert.ok(workspace >= 0)
+    assert.ok(indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace'], workspace + 1) < 0, 'bound once')
 
-  assert.ok(indexOfSequence(argv, ['--chdir', '/workspace']) > workspace)
-  assert.ok(indexOfSequence(argv, ['--setenv', 'HOME', '/workspace']) > workspace)
-  for (const name of config.dropEnv) {
-    assert.ok(indexOfSequence(argv, ['--unsetenv', name]) > 0, `${name} is dropped`)
-  }
-  assert.deepEqual(argv.slice(-6), ['--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent'])
+    assert.ok(indexOfSequence(argv, ['--chdir', '/workspace']) > workspace)
+    assert.ok(indexOfSequence(argv, ['--setenv', 'HOME', '/workspace']) > workspace)
+    for (const name of config.dropEnv) {
+      assert.ok(indexOfSequence(argv, ['--unsetenv', name]) > 0, `${name} is dropped`)
+    }
+    assert.deepEqual(argv.slice(-6), ['--dev', '/dev', '--unshare-pid', '--proc', '/proc', '--die-with-parent'])
+  })
 })
 
 test('read-only mode binds the workspace read-only, and privateTmp controls /tmp', () => {
-  const argv = profileArgs({ ...policy, mode: 'read-only' }, config)
-  assert.ok(indexOfSequence(argv, ['--ro-bind', policy.workspaceRoot, '/workspace']) >= 0)
-  assert.ok(indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace']) < 0)
-  assert.ok(indexOfSequence(argv, ['--tmpfs', '/tmp']) >= 0)
+  withProfile(({ config, policy }) => {
+    const argv = profileArgs({ ...policy, mode: 'read-only' }, config)
+    assert.ok(indexOfSequence(argv, ['--ro-bind', policy.workspaceRoot, '/workspace']) >= 0)
+    assert.ok(indexOfSequence(argv, ['--bind', policy.workspaceRoot, '/workspace']) < 0)
+    assert.ok(indexOfSequence(argv, ['--tmpfs', '/tmp']) >= 0)
 
-  const shared = profileArgs({ ...policy, mode: 'read-only' }, { ...config, privateTmp: false })
-  assert.ok(indexOfSequence(shared, ['--tmpfs', '/tmp']) < 0)
-  // The only difference is the one mask, so the rest of the profile is shared.
-  assert.equal(argv.length - shared.length, 2)
+    const shared = profileArgs({ ...policy, mode: 'read-only' }, { ...config, privateTmp: false })
+    assert.ok(indexOfSequence(shared, ['--tmpfs', '/tmp']) < 0)
+    // The only difference is the one mask, so the rest of the profile is shared.
+    assert.equal(argv.length - shared.length, 2)
+  })
 })

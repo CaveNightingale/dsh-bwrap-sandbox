@@ -98,7 +98,11 @@ export const Config: z<Config> = z.object({
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
+  agentsHome: z.string().default(''),
+  skillsRoot: z.string().default(''),
+  userInstructionsFile: z.string().default(''),
   additionalReadOnlyRoots: z.array(z.string()).default([]),
+  writableRoots: z.array(z.string()).default([]),
   pathArguments: z.dict(z.string()).default({ ...DEFAULT_PATH_ARGUMENTS }),
   pathArrayArguments: z.dict(z.string()).default({ ...DEFAULT_PATH_ARRAY_ARGUMENTS }),
 })
@@ -211,16 +215,31 @@ export function apply(ctx: Context, config: Config): void {
       const virtualPath = hostToVirtual(candidate, mounts) ?? toVirtualPath(candidate, VIRTUAL_WORKSPACE)
       try {
         const mapped = mapPath(virtualPath, mounts)
-        if (mapped.host === FAKE_ROOT) {
-          return `path boundary: ${JSON.stringify(candidate)} is the virtual root, not a file`
-        }
+        if (mapped.host === FAKE_ROOT) return notFound(candidate)
       } catch (error) {
         // Fail closed: a path that cannot be placed, or cannot be inspected at
         // all, is not a path this guard can vouch for.
-        const reason = error instanceof PathDeniedError ? error.message : `cannot inspect it (${String(error)})`
-        return `path boundary: ${JSON.stringify(candidate)}: ${reason}`
+        if (error instanceof PathDeniedError) return notFound(candidate)
+        return `path boundary: ${JSON.stringify(candidate)}: cannot inspect it (${String(error)})`
       }
     }
     return undefined
   })
+}
+
+/**
+ * The message every path outside the mount table gets, for both the virtual
+ * root and a top-level name no mount covers.
+ *
+ * The guard denies the call either way — `grep` and `glob` reach the host
+ * filesystem without passing through `ctx.fs`, so only this check stands in
+ * front of them. The wording is the namespace's answer rather than a boundary
+ * report: a path the sandbox does not have reads as missing, the way it does for
+ * the backend, and the fence's shape is not disclosed to the model.
+ *
+ * @param candidate - the tool's argument, for the message.
+ * @returns the denial reason.
+ */
+function notFound(candidate: string): string {
+  return `cannot access ${JSON.stringify(candidate)}: not found`
 }

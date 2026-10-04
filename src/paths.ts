@@ -44,6 +44,30 @@ export const VIRTUAL_ATTACHMENTS = '/attachments'
  */
 export const VIRTUAL_SPILL = '/spill'
 
+/**
+ * Virtual root the user-level agents home (`~/.agents`) is presented at.
+ *
+ * It carries the `user-agents` skill root (`skills/`) that
+ * `@deepseek-ai/dsh-skill-filesystem` reads through `ctx.fs`; without a mount
+ * the loader finds nothing and reports no skills.
+ */
+export const VIRTUAL_AGENTS = '/agents'
+
+/**
+ * Virtual root the user-level DSH skill root (`$DSH_HOME/skills`) is presented
+ * at. Its `user-dsh` skills are read through `ctx.fs` like `user-agents`.
+ */
+export const VIRTUAL_SKILLS = '/skills'
+
+/**
+ * Virtual name of the user-global instruction file (`$DSH_HOME/AGENTS.md`).
+ *
+ * It is a file mount, not a directory: the harness reads exactly that one path
+ * for user-global instructions, and its parent `$DSH_HOME` also holds
+ * credentials, so only the file is exposed.
+ */
+export const VIRTUAL_USER_INSTRUCTIONS = '/AGENTS.md'
+
 /** Identity of the virtual root, which stands for no host directory of its own. */
 export const FAKE_ROOT = Symbol('dsh-bwrap-sandbox/virtual-root')
 

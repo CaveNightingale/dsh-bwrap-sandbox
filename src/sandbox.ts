@@ -4,9 +4,10 @@
  * Every `ctx.sandbox.confine()` consumer — `bash`, `pwsh`, the PTY shell, and
  * PTC `run_code` — reaches this provider, so one mount profile bounds all four.
  * The profile masks every home directory, binds the session workspace at
- * `/workspace`, and exposes the session and attachment stores read-only at
- * stable virtual paths, so nothing a confined process can print names a host
- * path.
+ * `/workspace`, and exposes the session, attachment, and spill stores plus the
+ * user-level agents home, skill root, and instruction file read-only at stable
+ * virtual paths, so nothing a confined process can print names a host path and
+ * the same names resolve for the file tools.
  *
  * Linux only and fail-closed: bubblewrap is the sole backend, and a host
  * without a usable `bwrap` refuses the command rather than running it
@@ -16,12 +17,23 @@
  */
 
 import { spawnSync } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { Context } from '@deepseek-ai/cordis'
 import z from '@deepseek-ai/schemastery'
 import { sandboxDenialMarker, SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
-import { trimSeparator, VIRTUAL_ATTACHMENTS, VIRTUAL_SESSIONS, VIRTUAL_SPILL, VIRTUAL_WORKSPACE } from './paths.js'
+import { defaultAgentsHome, USER_INSTRUCTIONS_FILE } from './mounts.js'
+import {
+  trimSeparator,
+  VIRTUAL_AGENTS,
+  VIRTUAL_ATTACHMENTS,
+  VIRTUAL_SESSIONS,
+  VIRTUAL_SKILLS,
+  VIRTUAL_SPILL,
+  VIRTUAL_USER_INSTRUCTIONS,
+  VIRTUAL_WORKSPACE,
+} from './paths.js'
 
 export const name = 'bwrap-sandbox'
 
@@ -49,8 +61,31 @@ export interface Config {
    * `fs-bwrap` rows, which are configured separately.
    */
   spillRoot?: string
+  /**
+   * Host user-level agents home exposed read-only at `/agents`; empty resolves
+   * `$DSH_AGENTS_HOME` or `~/.agents`. Must match the `agentsHome` of the
+   * `fs-bwrap` and `guard-bwrap` rows, which are configured separately.
+   */
+  agentsHome?: string
+  /** Host user-level DSH skill root exposed read-only at `/skills`; empty resolves `$DSH_HOME/skills`. */
+  skillsRoot?: string
+  /**
+   * Host user-global instruction file exposed read-only at `/AGENTS.md`; empty
+   * resolves `$DSH_HOME/AGENTS.md`. The file usually does not exist, which is
+   * normal: the mount is skipped and the tool side reports it as absent.
+   */
+  userInstructionsFile?: string
   /** Mount a private writable `/tmp` (default true). */
   privateTmp?: boolean
+  /**
+   * Virtual mounts bound writable instead of read-only: a confined process may
+   * write inside them, which is what makes agent-authored skills possible.
+   *
+   * Must list the same mounts as the `fs-bwrap` row, which admits the write; a
+   * mount writable here but read-only there fails as a denial. `read-only` mode
+   * is unaffected and still denies every mutation.
+   */
+  writableRoots?: string[]
   /**
    * Environment names the confined process must not see, because their values
    * name host paths. Restore a name to a child by listing it in the shell tool's
@@ -65,7 +100,11 @@ export const Config: z<Config> = z.object({
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
+  agentsHome: z.string().default(''),
+  skillsRoot: z.string().default(''),
+  userInstructionsFile: z.string().default(''),
   privateTmp: z.boolean().default(true),
+  writableRoots: z.array(z.string()).default([]),
   dropEnv: z.array(z.string()).default(['DSH_HOME', 'DSH_PROFILE_DIR']),
 })
 
@@ -75,6 +114,25 @@ const DENIAL_SIGNATURES = ['read-only file system'] as const
 /** Bubblewrap's own fatal-diagnostic prefix, so runner failures stay distinguishable. */
 const RUNNER_FAILURE_RULES = [{ fatalSignatures: ['bwrap: '] }] as const
 
+/**
+ * Bind one host source read-only at its virtual name, when the source exists.
+ *
+ * A missing source makes bubblewrap refuse the entire profile (`bwrap: Can't
+ * find source path`), which would take the workspace down with it: a fresh
+ * `$DSH_HOME`, an absent `~/.agents`, and a user who never wrote a user-global
+ * `AGENTS.md` are all normal states. The tool side reports the same absence as
+ * `FS_NOT_FOUND`, so both views agree the store is not there.
+ *
+ * @param args - the profile argv being built.
+ * @param source - the absolute host directory or file; empty skips the bind.
+ * @param virtual - the virtual path to expose it at.
+ * @param writable - bind read-write instead of read-only.
+ */
+function bindIfPresent(args: string[], source: string, virtual: string, writable: boolean): void {
+  if (source.length === 0 || !existsSync(source)) return
+  args.push(writable ? '--bind' : '--ro-bind', source, virtual)
+}
+
 /** Fully resolved configuration after `apply` defaulting. */
 interface ResolvedConfig {
   systemReadOnlyRoots: readonly string[]
@@ -82,7 +140,11 @@ interface ResolvedConfig {
   sessionsRoot: string
   attachmentsRoot: string
   spillRoot: string
+  agentsHome: string
+  skillsRoot: string
+  userInstructionsFile: string
   privateTmp: boolean
+  writableRoots: readonly string[]
   dropEnv: readonly string[]
 }
 
@@ -96,9 +158,11 @@ interface ResolvedConfig {
  * live under a masked root: bubblewrap resolves a bind SOURCE in the host
  * namespace, so those mounts still work and reveal nothing.
  *
- * `/sessions`, `/attachments`, and `/spill` are read-only on purpose: the
- * harness writes them from outside the sandbox, and a confined process needs to
- * read spilled results, never to forge or delete them.
+ * `/sessions`, `/attachments`, `/spill`, `/agents`, `/skills`, and `/AGENTS.md`
+ * are read-only on purpose: the harness writes them from outside the sandbox, and
+ * a confined process needs to read spilled results, skills, and instructions,
+ * never to forge or delete them. Each bind is skipped when its host source is
+ * absent, which is the same state the tool side reports as `FS_NOT_FOUND`.
  *
  * @param policy - the per-call file-effect policy; the workspace root is canonical.
  * @param config - the resolved mount profile.
@@ -112,9 +176,18 @@ export function profileArgs(policy: SandboxPolicy, config: ResolvedConfig): stri
 
   for (const root of config.maskedRoots) args.push('--tmpfs', root)
 
-  if (config.sessionsRoot.length > 0) args.push('--ro-bind', config.sessionsRoot, VIRTUAL_SESSIONS)
-  if (config.attachmentsRoot.length > 0) args.push('--ro-bind', config.attachmentsRoot, VIRTUAL_ATTACHMENTS)
-  if (config.spillRoot.length > 0) args.push('--ro-bind', config.spillRoot, VIRTUAL_SPILL)
+  const writable = new Set(config.writableRoots)
+  bindIfPresent(args, config.sessionsRoot, VIRTUAL_SESSIONS, writable.has(VIRTUAL_SESSIONS))
+  bindIfPresent(args, config.attachmentsRoot, VIRTUAL_ATTACHMENTS, writable.has(VIRTUAL_ATTACHMENTS))
+  bindIfPresent(args, config.spillRoot, VIRTUAL_SPILL, writable.has(VIRTUAL_SPILL))
+  bindIfPresent(args, config.agentsHome, VIRTUAL_AGENTS, writable.has(VIRTUAL_AGENTS))
+  bindIfPresent(args, config.skillsRoot, VIRTUAL_SKILLS, writable.has(VIRTUAL_SKILLS))
+  bindIfPresent(
+    args,
+    config.userInstructionsFile,
+    VIRTUAL_USER_INSTRUCTIONS,
+    writable.has(VIRTUAL_USER_INSTRUCTIONS),
+  )
 
   if (config.privateTmp) args.push('--tmpfs', '/tmp')
 
@@ -156,7 +229,12 @@ export class BwrapSandboxProvider extends SandboxProvider {
       sessionsRoot,
       attachmentsRoot,
       spillRoot,
+      // The user-level inputs the harness itself reads through `ctx.fs`.
+      agentsHome: (config.agentsHome as string) || defaultAgentsHome(),
+      skillsRoot: (config.skillsRoot as string) || dshHomePath('skills'),
+      userInstructionsFile: (config.userInstructionsFile as string) || dshHomePath(USER_INSTRUCTIONS_FILE),
       privateTmp: config.privateTmp as boolean,
+      writableRoots: config.writableRoots as string[],
       dropEnv: config.dropEnv as string[],
     }
   }

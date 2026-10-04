@@ -8,8 +8,9 @@
  *   shell, and PTC `run_code`, masks every home directory, and presents the
  *   workspace as `/workspace`.
  * - `./bash` — `ctx.shell`, placing the shell tool's `workdir` in that namespace.
- * - `./fs` — `ctx.fs` fenced to the session workspace, with the session and
- *   attachment stores readable through virtual paths.
+ * - `./fs` — `ctx.fs` fenced to the session workspace, with the session,
+ *   attachment, and spill stores, the user-level agents home and skill root, and
+ *   the user-global instruction file readable through virtual paths.
  * - `./guard` — `ctx.tools.guard()` for the tools that reach the filesystem
  *   without passing through `ctx.fs`.
  * - `./spill` — `ctx.spillStore` writing `/spill/...` locators instead of host
@@ -34,14 +35,17 @@ export {
 } from './guard.js'
 export type { ArgumentTables } from './guard.js'
 export { BwrapSpillStore, Config as SpillConfig, encodeSegment, name as spillName, sessionDirectoryName } from './spill.js'
-export { assertMountConfig, buildMounts } from './mounts.js'
+export { assertMountConfig, buildMounts, defaultAgentsHome, USER_INSTRUCTIONS_FILE } from './mounts.js'
 export type { MountConfig } from './mounts.js'
 export {
   FAKE_ROOT,
   PathDeniedError,
+  VIRTUAL_AGENTS,
   VIRTUAL_ATTACHMENTS,
   VIRTUAL_SESSIONS,
+  VIRTUAL_SKILLS,
   VIRTUAL_SPILL,
+  VIRTUAL_USER_INSTRUCTIONS,
   VIRTUAL_WORKSPACE,
   canonicalizeHostPath,
   hostToVirtual,

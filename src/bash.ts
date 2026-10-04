@@ -49,13 +49,17 @@ export const name = 'bash-bwrap'
  * schema and passes these fields through; this schema resolves them.
  *
  * The cost is that `--dump-config-schema` lists the inherited knobs for this row
- * and not these fields. The README carries the same four names for every row.
+ * and not these fields. The README carries the same names for every row.
  */
 const mountsSchema = z.object({
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
   spillRoot: z.string().default(''),
+  agentsHome: z.string().default(''),
+  skillsRoot: z.string().default(''),
+  userInstructionsFile: z.string().default(''),
   additionalReadOnlyRoots: z.array(z.string()).default([]),
+  writableRoots: z.array(z.string()).default([]),
 })
 
 /** Plugin config: the local executor's knobs, plus the virtual namespace's mounts. */

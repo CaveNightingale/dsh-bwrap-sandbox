@@ -1,4 +1,4 @@
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import assert from 'node:assert/strict'
@@ -11,9 +11,10 @@ import { apply as applyGuard } from '../lib/guard.js'
  * Build a workspace with the alias shapes the fence must separate, wiring the
  * real backend and the real guard the way the profile does.
  * @param extraRoots - `additionalReadOnlyRoots` for both plugins.
+ * @param overrides - further settings, such as `writableRoots`.
  * @returns the temp root, the backend, the guard, and a tool-call builder.
  */
-function fixture(extraRoots = []) {
+function fixture(extraRoots = [], overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), 'bwrap-fence-'))
   const workspace = join(root, 'ws')
   mkdirSync(join(workspace, 'src'), { recursive: true })
@@ -23,13 +24,24 @@ function fixture(extraRoots = []) {
   symlinkSync(workspace, join(root, 'outside', 'ws'))
   // A link inside the workspace pointing out of it.
   symlinkSync('/etc', join(workspace, 'escape'))
+  // The user-level inputs the harness itself reads through `ctx.fs`.
+  mkdirSync(join(root, 'agents', 'skills', 'demo'), { recursive: true })
+  writeFileSync(join(root, 'agents', 'skills', 'demo', 'SKILL.md'), '---\nname: demo\n---\nbody\n')
+  mkdirSync(join(root, 'skills', 'local'), { recursive: true })
+  writeFileSync(join(root, 'skills', 'local', 'SKILL.md'), '---\nname: local\n---\nbody\n')
 
   const settings = {
     cwd: workspace,
     diffBasisMaxBytes: 10 * 1024 * 1024,
     sessionsRoot: '',
     attachmentsRoot: '',
+    agentsHome: join(root, 'agents'),
+    skillsRoot: join(root, 'skills'),
+    // Deliberately absent: `$DSH_HOME/AGENTS.md` is optional.
+    userInstructionsFile: join(root, 'AGENTS.md'),
     additionalReadOnlyRoots: extraRoots,
+    writableRoots: [],
+    ...overrides,
   }
   const fsContext = new Context()
   fsContext.provide('sandboxPolicy', { defaultMode: 'workspace-write' })
@@ -53,9 +65,10 @@ function fixture(extraRoots = []) {
  * Run `body` against a fixture and clean up afterwards.
  * @param extraRoots - `additionalReadOnlyRoots`.
  * @param body - receives the fixture; it is awaited before cleanup.
+ * @param overrides - further settings, such as `writableRoots`.
  */
-async function withFixture(extraRoots, body) {
-  const context = fixture(extraRoots)
+async function withFixture(extraRoots, body, overrides = {}) {
+  const context = fixture(extraRoots, overrides)
   try {
     await body(context)
   } finally {
@@ -75,31 +88,31 @@ test('a virtual path, a host path, and a relative path all resolve to the virtua
   })
 })
 
-test('an alias outside the mounts that resolves into the workspace is refused', async () => {
+test('an alias outside the mounts that resolves into the workspace reads as absent', async () => {
   await withFixture([], async ({ root, backend, guard, call }) => {
     const aliased = join(root, 'outside', 'ws', 'src', 'a.txt')
     await assert.rejects(backend.resolve(aliased), error => {
-      assert.equal(error.code, 'FS_SANDBOX_DENIED')
+      assert.equal(error.code, 'FS_NOT_FOUND')
       return true
     })
-    assert.match(guard(call('read', { file_path: aliased })), /outside every visible root/)
+    assert.match(guard(call('read', { file_path: aliased })), /not found/)
   })
 })
 
-test('a link inside the workspace that points outside it is refused', async () => {
+test('a link inside the workspace that points outside it reads as absent', async () => {
   await withFixture([], async ({ backend, guard, call }) => {
     for (const path of ['/workspace/escape', '/workspace/escape/passwd']) {
       await assert.rejects(backend.resolve(path), error => {
-        assert.equal(error.code, 'FS_SANDBOX_DENIED')
-        assert.match(error.message, /outside every visible root/)
+        assert.equal(error.code, 'FS_NOT_FOUND')
+        assert.match(error.message, /not found/)
         return true
       })
-      assert.match(guard(call('read', { file_path: path })), /outside every visible root/)
+      assert.match(guard(call('read', { file_path: path })), /not found/)
     }
   })
 })
 
-test('paths out of the mount namespace are refused by both fences', async () => {
+test('paths out of the mount namespace read as absent to both fences', async () => {
   await withFixture([], async ({ backend, guard, call }) => {
     const refused = [
       '/etc/passwd',
@@ -109,12 +122,44 @@ test('paths out of the mount namespace are refused by both fences', async () => 
     ]
     for (const path of refused) {
       await assert.rejects(backend.resolve(path), error => {
-        assert.equal(error.code, 'FS_SANDBOX_DENIED')
+        assert.equal(error.code, 'FS_NOT_FOUND')
         return true
       })
-      assert.match(guard(call('read', { file_path: path })), /path boundary/)
+      assert.match(guard(call('read', { file_path: path })), /not found/)
     }
-    assert.match(guard(call('grep', { path: '/' })), /is the virtual root, not a file/)
+    assert.match(guard(call('grep', { path: '/' })), /not found/)
+  })
+})
+
+test('the user-level agents home and DSH skill root are reachable in both spellings', async () => {
+  await withFixture([], async ({ root, backend, guard, call }) => {
+    const hostSkill = join(root, 'agents', 'skills', 'demo', 'SKILL.md')
+    assert.equal((await backend.resolve('/agents/skills/demo/SKILL.md')).targetKey, hostSkill)
+    // The loader hands over host paths, so the mount has to answer in both.
+    assert.equal((await backend.resolve(hostSkill)).displayPath, '/agents/skills/demo/SKILL.md')
+    assert.equal((await backend.resolve('/skills/local/SKILL.md')).displayPath, '/skills/local/SKILL.md')
+
+    assert.equal(guard(call('read', { file_path: '/agents/skills/demo/SKILL.md' })), undefined)
+    assert.equal(guard(call('read', { file_path: '/skills/local/SKILL.md' })), undefined)
+  })
+})
+
+test('the user-global instruction file reads as absent until it exists', async () => {
+  await withFixture([], async ({ root, backend, guard, call }) => {
+    // `$DSH_HOME/AGENTS.md` is optional. Resolution succeeds the way it does for
+    // any file a later write may create; the probe that decides whether the
+    // instructions load is `stat`, and it must read as absent.
+    const missing = await backend.resolve('/AGENTS.md')
+    assert.equal(missing.displayPath, '/AGENTS.md')
+    assert.equal(await backend.stat(missing), undefined)
+
+    writeFileSync(join(root, 'AGENTS.md'), 'user-global rules\n')
+
+    const present = await backend.resolve('/AGENTS.md')
+    assert.equal(present.targetKey, join(root, 'AGENTS.md'))
+    assert.equal((await backend.resolve(join(root, 'AGENTS.md'))).displayPath, '/AGENTS.md')
+    assert.equal((await backend.stat(present)).type, 'file')
+    assert.equal(guard(call('read', { file_path: '/AGENTS.md' })), undefined)
   })
 })
 
@@ -135,7 +180,7 @@ test('an extra root admits that tree, and nothing outside it', async () => {
     // The alias now names a path inside the extra root, so it is followed — and
     // lands on the workspace file it already pointed at, granting no new tree.
     assert.equal((await backend.resolve(join(root, 'outside', 'ws', 'src', 'a.txt'))).targetKey, join(workspace, 'src', 'a.txt'))
-    assert.match(guard(call('read', { file_path: '/etc/passwd' })), /outside every visible root/)
+    assert.match(guard(call('read', { file_path: '/etc/passwd' })), /not found/)
   })
 })
 
@@ -146,6 +191,79 @@ test('an extra root that is not a single top-level directory fails loud at load'
     () => applyGuard(context, { additionalReadOnlyRoots: ['/var/tmp'] }),
     /must be a single top-level directory/,
   )
+})
+
+test('a writable root accepts a write the policy would deny, and an unlisted one does not', async t => {
+  // The policy's writable set is the session workspace plus the platform temp
+  // areas, so a mount has to live outside `tmpdir()` for the exception to be
+  // observable at all.
+  let root
+  try {
+    root = mkdtempSync('/var/tmp/bwrap-writable-')
+  } catch (error) {
+    t.skip(`no /var/tmp on this host (${String(error)})`)
+    return
+  }
+  const agents = join(root, 'agents')
+  const skills = join(root, 'skills')
+  const workspace = join(root, 'ws')
+  mkdirSync(join(agents, 'skills', 'demo'), { recursive: true })
+  mkdirSync(join(skills, 'local'), { recursive: true })
+  mkdirSync(workspace)
+  const settings = {
+    cwd: workspace,
+    diffBasisMaxBytes: 10 * 1024 * 1024,
+    sessionsRoot: '',
+    attachmentsRoot: '',
+    agentsHome: agents,
+    skillsRoot: skills,
+    userInstructionsFile: join(root, 'AGENTS.md'),
+    additionalReadOnlyRoots: [],
+  }
+  const backendFor = writableRoots => {
+    const context = new Context()
+    context.provide('sandboxPolicy', { defaultMode: 'workspace-write' })
+    return new WorkspaceFileSystem(context, { ...settings, writableRoots })
+  }
+  const policy = { mode: 'workspace-write', workspaceRoot: workspace }
+  const denied = error => {
+    assert.equal(error.code, 'FS_SANDBOX_DENIED')
+    return true
+  }
+
+  try {
+    const writable = backendFor(['/agents'])
+    const authored = await writable.resolve('/agents/skills/demo/note.md')
+    await writable.writeText(authored, 'agent-authored\n', undefined, undefined, policy)
+    // The bytes land in the host directory the skill loader reads.
+    assert.equal(readFileSync(join(agents, 'skills', 'demo', 'note.md'), 'utf8'), 'agent-authored\n')
+
+    // Without the option the same write is the inherited workspace-only fence.
+    const plain = backendFor([])
+    await assert.rejects(
+      plain.writeText(await plain.resolve('/agents/skills/demo/other.md'), 'no\n', undefined, undefined, policy),
+      denied,
+    )
+
+    // A mount that is not listed stays read-only, and `read-only` mode denies
+    // even a listed one.
+    await assert.rejects(
+      writable.writeText(await writable.resolve('/skills/local/note.md'), 'no\n', undefined, undefined, policy),
+      denied,
+    )
+    await assert.rejects(
+      writable.writeText(authored, 'no\n', undefined, undefined, { mode: 'read-only', workspaceRoot: workspace }),
+      denied,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('a writable root that names no mount fails loud at load', () => {
+  const context = new Context()
+  context.provide('tools', { guard: () => {} })
+  assert.throws(() => applyGuard(context, { writableRoots: ['/agents/skills'] }), /names no mount/)
 })
 
 test('the backend resolves /spill to its configured spillRoot', async () => {

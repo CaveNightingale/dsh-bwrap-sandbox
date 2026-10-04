@@ -42,20 +42,27 @@ and a host path is written into the session log. `spill-bwrap` writes the same
 bytes and reports `/spill/...`, which the mount table resolves and a confined
 process reads at the same path.
 
-The two fences answer different questions and deliberately disagree. Inside the
-sandbox, a shell can read `/etc` and `/usr` because the system roots are bound
-read-only there — a shell that cannot read `/etc` cannot start. The file tools
-are fenced to the mounts and refuse those same paths, so `bash -c 'cat
-/etc/passwd'` works while `read /etc/passwd` and `grep /` do not. A link inside
-the workspace pointing at `/etc` is refused by the tools for the same reason,
-even though a confined process follows it.
+The two fences answer different questions, so they disagree on what they say
+about the same path. Inside the sandbox a shell can read `/etc` and `/usr`,
+because the system roots are bound read-only there — a shell that cannot read
+`/etc` cannot start. The file tools are narrowed to the mounts, so `bash -c 'cat
+/etc/passwd'` works while `read /etc/passwd` and `grep /` fail.
+
+What they say is **absent**, not denied: `ctx.fs` answers `FS_NOT_FOUND` and the
+guard answers `cannot access "<path>": not found`. That is literally what a
+confined process sees at a masked home directory or at a name the profile never
+mounts, and it is the answer a caller probing for an optional file can act on.
+Reporting a boundary refusal instead makes project-root discovery and skill
+loading treat an ordinary absence as a broken backend, which is how an ancestor
+`.git` probe used to abort AGENTS.md loading.
 
 ## The virtual namespace
 
 The model names files in a virtual namespace whose top level holds only the
-mounted roots — `/workspace`, `/sessions`, `/attachments`, `/spill`, and any
-extra root an operator adds. One recursive walk maps a virtual path to a host
-path, and a segment it cannot place refuses the whole call:
+mounted roots — `/workspace`, `/sessions`, `/attachments`, `/spill`, `/agents`,
+`/skills`, `/AGENTS.md`, and any extra root an operator adds. One recursive walk
+maps a virtual path to a host path, and a segment it cannot place fails the call
+as **not found**:
 
 ```
 map(v):
@@ -104,8 +111,8 @@ of the workspace agree link for link:
 |---|---|---|
 | `/workspace/src/a.txt` | resolves | resolves |
 | `src/a.txt` | resolves | resolves |
-| `<the real workspace>/src/a.txt` | dangling — no such path inside | refused |
-| `/etc/passwd` | resolves to the read-only bind | refused |
+| `<the real workspace>/src/a.txt` | dangling — no such path inside | not found |
+| `/etc/passwd` | resolves to the read-only bind | not found |
 
 ### The terminal tools
 
@@ -167,6 +174,9 @@ bwrap
   --ro-bind <DSH_HOME>/sessions    /sessions
   --ro-bind <DSH_HOME>/attachments /attachments
   --ro-bind <DSH_HOME>/spill       /spill
+  --ro-bind <DSH_AGENTS_HOME>      /agents        # default: ~/.agents
+  --ro-bind <DSH_HOME>/skills      /skills
+  --ro-bind <DSH_HOME>/AGENTS.md   /AGENTS.md
   --tmpfs /tmp
   --bind   <workspace> /workspace                # --ro-bind under read-only
   --chdir  /workspace
@@ -186,9 +196,28 @@ Two ordering facts make this work, both verified against bubblewrap 0.12.0:
   under the masked `/home`. The store is reachable at `/sessions`; `/home` stays
   empty.
 
-The three stores are bound read-only on purpose. The harness writes them from
-outside the sandbox, and a confined process needs to read a spilled result,
-never to forge or delete one.
+The read-only binds are on purpose. The harness writes those directories from
+outside the sandbox, and a confined process needs to read a spilled result, a
+skill, or the user-global instructions — never to forge or delete one. Each of
+them is bound only when its host source exists, because bubblewrap refuses a
+profile whose bind source is missing and that would take the workspace down with
+it: a fresh `$DSH_HOME`, an absent `~/.agents`, and a user who never wrote
+`AGENTS.md` are all normal states. The tool side reports the same absence as
+`FS_NOT_FOUND`.
+
+A mount listed in `writableRoots` is bound with `--bind` instead, and the
+`fs-bwrap` row admits writes inside it. Everything else stays read-only, and
+`read-only` mode still denies every mutation. Configure the same list on both
+rows: a mount writable for the profile but fenced for the tools — or the reverse
+— fails as a denial or as `read-only file system`, depending on which gate ran
+first.
+
+The `/agents`, `/skills`, and `/AGENTS.md` mounts exist for the harness itself.
+`skill-filesystem` reads its `user-agents` and `user-dsh` skills through
+`ctx.fs`, and `agent-instructions` reads one user-global file, so without them
+those inputs are silently invisible — the loaders catch the error and report no
+skills or no user-global instructions rather than failing. `/AGENTS.md` is one
+file, not `$DSH_HOME`: that directory also holds credentials.
 
 `--chdir` re-anchors the child. The caller spawns with its own cwd — the host
 workspace path, applied before bubblewrap builds the namespace — so without it
@@ -205,6 +234,10 @@ the child would start in a directory that does not exist inside.
     sessionsRoot: ''          # default: $DSH_HOME/sessions
     attachmentsRoot: ''       # default: $DSH_HOME/attachments
     spillRoot: ''             # default: $DSH_HOME/spill
+    agentsHome: ''            # default: $DSH_AGENTS_HOME or ~/.agents
+    skillsRoot: ''            # default: $DSH_HOME/skills
+    userInstructionsFile: ''  # default: $DSH_HOME/AGENTS.md
+    writableRoots: []         # virtual mounts the agent may write, e.g. ['/agents']
     privateTmp: true
     dropEnv: ['DSH_HOME', 'DSH_PROFILE_DIR']
 ```
@@ -215,16 +248,28 @@ the child would start in a directory that does not exist inside.
 | `maskedRoots` | `/home`, `/root` | Directories replaced by an empty tmpfs. Writable but ephemeral: no host data is readable and nothing survives the process. |
 | `sessionsRoot` | `$DSH_HOME/sessions` | Host session-log directory, exposed read-only at `/sessions`. Set to a non-empty value to override; the empty default resolves `$DSH_HOME`. |
 | `attachmentsRoot` | `$DSH_HOME/attachments` | Host attachment store, exposed read-only at `/attachments`. |
-| `spillRoot` | `$DSH_HOME/spill` | Host spill directory, exposed read-only at `/spill`. Must match the `spillRoot` of the other three rows. |
+| `spillRoot` | `$DSH_HOME/spill` | Host spill directory, exposed read-only at `/spill`. Must match the `spillRoot` of the other rows. |
+| `agentsHome` | `$DSH_AGENTS_HOME` or `~/.agents` | Host user-level agents home, exposed read-only at `/agents`. Must match the `agentsHome` of `skill-filesystem`, whose `user-agents` skills are read from `<agentsHome>/skills`. |
+| `skillsRoot` | `$DSH_HOME/skills` | Host user-level DSH skill root, exposed read-only at `/skills`. Must match the `dshHome` of `skill-filesystem`, which reads `user-dsh` skills from `<dshHome>/skills`. |
+| `userInstructionsFile` | `$DSH_HOME/AGENTS.md` | Host user-global instruction file, exposed read-only at `/AGENTS.md`, the single path `agent-instructions` loads user-global instructions from. It usually does not exist, and then it is not bound and reads as absent. |
+| `writableRoots` | `[]` | Virtual mounts bound writable instead of read-only, e.g. `['/agents']`. Each entry must name a mount, and an unknown name fails at load. Must match the `fs-bwrap` row; see [Writable mounts](#writable-mounts). |
 | `privateTmp` | `true` | Mount a private writable `/tmp`. |
 | `dropEnv` | `DSH_HOME`, `DSH_PROFILE_DIR` | Environment names removed from every confined process, because their values name host paths. |
 
 `fs-bwrap` takes the local backend's own config (`cwd`, `diffBasisMaxBytes`) plus
-the four mount fields below. `guard-bwrap` and `spill-bwrap` take the same four,
-and all four rows must agree — they are separate plugins with separate configs,
-and a value set on one has no effect on the others. A `spillRoot` that disagrees
-is the sharpest case: `spill-bwrap` builds a `/spill/...` locator for one host
-directory and the other rows resolve it to another.
+the mount fields below. `guard-bwrap` takes the same ones, and `spill-bwrap`
+takes `spillRoot`, which must match theirs. They are separate plugins with
+separate configs, so a value set on one has no effect on the others. A
+`spillRoot` that disagrees is the sharpest case: `spill-bwrap` builds a
+`/spill/...` locator for one host directory and the other rows resolve it to
+another. The same hazard applies to `agentsHome`, `skillsRoot`, and
+`userInstructionsFile`, whose defaults follow another plugin's configuration:
+`skill-filesystem` reads user skills from `<its dshHome>/skills` and
+`<its agentsHome>/skills`, and `agent-instructions` reads
+`<its dshHome>/AGENTS.md`, through `ctx.fs`. A loader pointed at a directory no
+mount covers finds nothing and reports nothing — it catches the unresolvable
+path and answers "no skills", or "no user-global instructions" — so a mismatch
+here is invisible until someone notices what is missing from the prompt.
 
 ```yaml
 - id: fs-bwrap
@@ -233,6 +278,10 @@ directory and the other rows resolve it to another.
     sessionsRoot: ''              # default: $DSH_HOME/sessions
     attachmentsRoot: ''           # default: $DSH_HOME/attachments
     spillRoot: ''                 # default: $DSH_HOME/spill
+    agentsHome: ''                # default: $DSH_AGENTS_HOME or ~/.agents
+    skillsRoot: ''                # default: $DSH_HOME/skills
+    userInstructionsFile: ''      # default: $DSH_HOME/AGENTS.md
+    writableRoots: []             # keep identical to the bwrap-sandbox row
     additionalReadOnlyRoots: []
 
 - id: guard-bwrap
@@ -241,6 +290,10 @@ directory and the other rows resolve it to another.
     sessionsRoot: ''              # keep identical to the fs-bwrap row
     attachmentsRoot: ''           # keep identical to the fs-bwrap row
     spillRoot: ''                 # keep identical to the fs-bwrap row
+    agentsHome: ''                # keep identical to the fs-bwrap row
+    skillsRoot: ''                # keep identical to the fs-bwrap row
+    userInstructionsFile: ''      # keep identical to the fs-bwrap row
+    writableRoots: []             # validated here, acted on by fs-bwrap
     additionalReadOnlyRoots: []
 
 - id: spill-bwrap
@@ -255,6 +308,10 @@ directory and the other rows resolve it to another.
 | `sessionsRoot` | `$DSH_HOME/sessions` | Host session-log directory, exposed read-only at `/sessions`. |
 | `attachmentsRoot` | `$DSH_HOME/attachments` | Host attachment store, exposed read-only at `/attachments`. |
 | `spillRoot` | `$DSH_HOME/spill` | Host directory the artifacts are written to and read from, exposed read-only at `/spill`. |
+| `agentsHome` | `$DSH_AGENTS_HOME` or `~/.agents` | Host user-level agents home, exposed read-only at `/agents`. |
+| `skillsRoot` | `$DSH_HOME/skills` | Host user-level DSH skill root, exposed read-only at `/skills`. |
+| `userInstructionsFile` | `$DSH_HOME/AGENTS.md` | Host user-global instruction file, exposed read-only at `/AGENTS.md`. |
+| `writableRoots` | `[]` | Virtual mounts the file tools may write inside, e.g. `['/agents']`. Only `fs-bwrap` acts on it; the other rows validate the name so a typo fails at load. |
 | `additionalReadOnlyRoots` | `[]` | Extra host directories mounted as further virtual roots under their own path. Each entry must be a single top-level directory (`/tmp`, not `/var/tmp`), because a virtual mount is one name; anything else fails at load rather than becoming an unreachable directory. |
 | `cleanupPeriodDays` | `30` | Age at which `spill-bwrap`'s one startup sweep reclaims an artifact and prunes the session directory it emptied. `0` disables the sweep. Retention is deliberate: a resumed or forked session may still reference an older locator until it ages out. |
 
@@ -338,6 +395,62 @@ A blank tool name, a blank argument, or one tool in both tables fails at load. A
 wrong argument name cannot be caught, and means the call carries nothing to
 inspect — see the limitations below.
 
+### Writable mounts
+
+By default every mount outside the workspace is read-only in both fences. A
+deployment that wants the agent to author a skill at the user level flips one
+mount:
+
+```yaml
+- id: bwrap-sandbox
+  config:
+    writableRoots: ['/agents']
+
+- id: fs-bwrap
+  config:
+    writableRoots: ['/agents']
+```
+
+Both rows are needed. `bwrap-sandbox` binds the mount read-write so a confined
+process can write, and `fs-bwrap` admits the write through its policy fence:
+`SandboxedFileSystem` permits a mutation only under the session workspace or a
+platform temp area and no policy field widens that set, so a listed mount is
+re-canonicalized and delegated past that one check. `read-only` mode still denies
+every mutation, and every mount not listed keeps the inherited fence.
+
+What the option decides: those directories are the instruction sources the agent
+reads. `~/.agents/skills` and `$DSH_HOME/skills` are shared by every session on
+the machine, and `/AGENTS.md` is the user-global instruction file itself, so a
+session that writes them writes what later sessions will follow. Skill authoring
+that does not need that reach already works: `skill-filesystem` also reads the
+project roots `<workspace>/.dsh/skills` and `<workspace>/.agents/skills`, which
+live inside the workspace, are writable, and are watched, so a skill written
+during a session is picked up.
+
+### Project-root discovery
+
+The bundle also clears the instruction loader's root markers:
+
+```yaml
+- id: agent-instructions
+  config:
+    maxBytes: 65536
+    projectRootMarkers: []
+```
+
+Discovery walks up from the session cwd probing `<dir>/.git`, then loads every
+`AGENTS.md`/`CLAUDE.md` between that root and the cwd. Inside the fence there is
+no ancestor project to find — the workspace mount is the whole visible project,
+and the tools cannot read the ancestors — so those probes are answered as absent
+and the walk would end at the workspace on its own. Clearing the markers stops
+the probes and states the intent. The user-global file still loads, from the
+`/AGENTS.md` mount. `maxBytes` is restated because a `config:` patch replaces
+the whole block; keep it in step with the base bundle's row.
+
+The prompt labels that file `~/.dsh/AGENTS.md`: `dsh-home-paths` never returns an
+absolute home path, so the label cannot follow the mount. Its content is injected
+at the start of the session, so nothing needs to read it by that name.
+
 ## Installing
 
 ```sh
@@ -356,10 +469,18 @@ last through `dsh plugin` does that.
 
 Unit tests (`npm test`) pin the profile ordering and the mapping: a virtual, a
 host, and a relative path reaching the same file; an alias outside the mounts
-refused; a link to `/etc` and a link holding a host path both refused; a link
+reading as absent; a link to `/etc` and a link holding a host path both reading
+as absent; a link
 holding `/workspace/...` and a relative link both followed; `/workspace/../etc/passwd`
-refused; `..` after a symlink landing at the target's parent; a symlink loop
-refused; an extra root reached under its own name only. The profile itself was
+reading as absent; `..` after a symlink landing at the target's parent; a symlink loop
+refused by the mapping; an extra root reached under its own name only; the
+user-level agents home, skill root, and instruction file reachable in both
+spellings; and a bind source that does not exist skipped rather than fatal. Three
+of them run the real `@deepseek-ai/dsh-agent-instructions` loader against the
+real backend: root discovery completes past an ancestor that has both a `.git`
+and its own `AGENTS.md`, that ancestor's instructions do not load, and a missing
+user-global file is not an error. Reverting the backend's `FS_NOT_FOUND` to a
+denial fails all three with the original `cannot access ".../.git"` abort. The profile itself was
 exercised end-to-end against real bubblewrap: under `workspace-write`, `/home`
 lists empty, `~/.bashrc` fails with `ENOENT`, the workspace reads and writes,
 `/usr` writes report `read-only file system`, `/sessions` lists the real session
@@ -396,7 +517,11 @@ is exercised through a real registered guard.
 - **The filesystem tools cannot write outside the workspace**, including `/tmp`,
   even though bash can. Write permission is `sandbox-policy`'s, not this
   package's: the stores are outside its writable roots, and the profile binds
-  them read-only. An extra root added here stays read-only for the tools.
+  them read-only. An extra root added here stays read-only for the tools unless
+  it is listed in `writableRoots`. The policy also allows the host temp areas,
+  which no mount names — unless `$DSH_HOME` itself lives under one, in which case
+  those stores are writable to the tools and only the profile's `--ro-bind`
+  refuses them.
 - **A replaced guard table covers only what it names.** The shipped table is the
   default, so nothing merges in: a `pathArguments` that omits `grep`, `glob`, or
   `lsp` stops fencing them, and this plugin is the only fence over those three.
@@ -406,10 +531,26 @@ is exercised through a real registered guard.
   reads the argument the config names; it cannot know what the tool does with it.
   An entry that names the wrong argument carries nothing to inspect and therefore
   fences nothing, which is why new entries are worth testing against a real call.
-- **`spillRoot` must be configured identically on all four rows.** They are
-  separate plugins; nothing checks the agreement. A mismatch makes `spill-bwrap`
-  write to one directory while `read` resolves the locator to another, which
-  fails as a missing file rather than as a denial.
+- **The mounts on the five rows must be configured identically.** `sessionsRoot`,
+  `attachmentsRoot`, `spillRoot`, `agentsHome`, `skillsRoot`, and
+  `userInstructionsFile` appear on more than one row, and nothing checks the
+  agreement: the rows are separate plugins. A mismatch makes one plugin write or
+  address a directory the others resolve elsewhere, which fails as a missing file
+  rather than as a denial. The loaders that read through these mounts
+  (`skill-filesystem.dshHome`/`agentsHome`, `agent-instructions.dshHome`) must
+  name the same hosts, and their failure is silent: an unresolvable path reads as
+  an empty skills catalog or an absent user-global instruction file.
+- **`writableRoots` must list the same mounts on `bwrap-sandbox` and
+  `fs-bwrap`.** They are separate plugins and nothing checks the agreement. A
+  mount writable only in the profile fails at the tool fence, one writable only
+  in the tools fails with `read-only file system` inside the sandbox, and listing
+  `/AGENTS.md` makes the user-global instructions writable by the session that
+  reads them.
+- **The guard cannot inspect a path it cannot map.** It answers `not found` for a
+  name outside the mounts, but an unexpected failure while mapping — an
+  unreadable directory on the way, say — still surfaces as
+  `path boundary: ... cannot inspect it (...)`. That is deliberate: the first is a
+  namespace answer, the second is a real error worth reporting.
 - **Spill artifacts accumulate for `cleanupPeriodDays`.** The sweep runs once at
   activation, so a long-running process does not reclaim while it runs, and
   `cleanupPeriodDays: 0` disables reclamation entirely. The files live under

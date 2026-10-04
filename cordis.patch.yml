@@ -39,14 +39,32 @@
 - id: spill-local
   disabled: true
 
+# Project-root discovery walks up from the session cwd probing `<dir>/.git`, and
+# then loads every AGENTS.md/CLAUDE.md between that root and the cwd. Inside the
+# fence there is no ancestor project to find: the workspace mount is the whole
+# visible project, every ancestor probe is answered as absent, and the tools
+# cannot read the ancestors anyway. Clearing the marker list stops the probes
+# outright, so the root is always the session workspace and only its own
+# instructions load. The user-global `$DSH_HOME/AGENTS.md` is still loaded, from
+# the `/AGENTS.md` mount below.
+#
+# `maxBytes` is restated because a `config:` patch replaces the whole block, not
+# deep-merges it; keep the value in step with the base bundle's row.
+- id: agent-instructions
+  config:
+    maxBytes: 65536
+    projectRootMarkers: []
+
 - insert:
     - id: bwrap-sandbox
       name: 'dsh-bwrap-sandbox/sandbox'
 
-    # The four rows below resolve against the same mount table: the session
-    # workspace at /workspace, the stores at /sessions and /attachments, spill
-    # output at /spill, plus `additionalReadOnlyRoots` if an operator adds any.
-    # They are separate plugins with separate config, and the values must agree.
+    # The rows below resolve against the same mount table: the session
+    # workspace at /workspace, the stores at /sessions, /attachments, and
+    # /spill, the user-level agents home at /agents, the user-level DSH skill
+    # root at /skills, the user-global instruction file at /AGENTS.md, plus
+    # `additionalReadOnlyRoots` if an operator adds any. They are separate
+    # plugins with separate config, and the values must agree.
     - id: bash-bwrap
       name: 'dsh-bwrap-sandbox/bash'
       # bash does not exist on Windows, and the base bundle disables the stock
