@@ -1,0 +1,105 @@
+import assert from 'node:assert/strict'
+import test from 'node:test'
+import { Context } from '@deepseek-ai/cordis'
+import {
+  Config,
+  DEFAULT_PATH_ARGUMENTS,
+  DEFAULT_PATH_ARRAY_ARGUMENTS,
+  apply as applyGuard,
+  resolveArgumentTables,
+} from '../lib/guard.js'
+
+/** Install the guard with `config` and return the registered decision function. */
+function guardFor(config) {
+  const guards = []
+  const context = new Context()
+  context.provide('tools', { guard: fn => guards.push(fn) })
+  applyGuard(context, config)
+  return guards[0]
+}
+
+/** A pending call for a tool, as the guard sees it. */
+function call(name, args, cwd = '/workspace') {
+  return { name, arguments: args, agent: { session: { header: { cwd } } } }
+}
+
+test('the shipped table is the field default, and omitting the field uses it', () => {
+  assert.deepEqual(Config({}).pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
+  assert.deepEqual(Config({}).pathArrayArguments, { ...DEFAULT_PATH_ARRAY_ARGUMENTS })
+  // A partially specified object still defaults the fields it omits.
+  const partial = Config({ sessionsRoot: '/tmp/sessions' })
+  assert.deepEqual(partial.pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
+  assert.equal(partial.sessionsRoot, '/tmp/sessions')
+})
+
+test('resolve returns the configured table as the whole table', () => {
+  assert.deepEqual(resolveArgumentTables({}).pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
+
+  // Setting the field replaces it: what is named is covered, and nothing else.
+  const configured = { notebook_edit: 'file_path', grep: 'pattern' }
+  const tables = resolveArgumentTables({ pathArguments: configured, pathArrayArguments: {} })
+  assert.deepEqual(tables.pathArguments, configured)
+  assert.deepEqual(tables.pathArrayArguments, {})
+  assert.equal('read' in tables.pathArguments, false, 'the shipped table is not merged in')
+})
+
+test('the resolved tables never alias the schema default', () => {
+  const first = resolveArgumentTables({})
+  first.pathArguments.grep = 'MUTATED'
+  delete first.pathArguments.read
+  assert.deepEqual(resolveArgumentTables({}).pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
+  assert.deepEqual(Config({}).pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
+})
+
+test('a blank name or argument, or a tool in both tables, fails loud', () => {
+  assert.throws(() => resolveArgumentTables({ pathArguments: { '  ': 'path' } }), /blank tool name/)
+  assert.throws(
+    () => resolveArgumentTables({ pathArguments: { grep: '  ' } }),
+    /is blank; list the argument it names a path in/,
+  )
+  assert.throws(
+    () => resolveArgumentTables({ pathArguments: { grep: 'path' }, pathArrayArguments: { grep: 'files' } }),
+    /listed in both pathArguments and pathArrayArguments/,
+  )
+})
+
+test('the default table fences the shipped tools', () => {
+  const guard = guardFor({})
+  for (const [name, args] of [
+    ['read', { file_path: '/etc/passwd' }],
+    ['write', { file_path: '/etc/passwd' }],
+    ['grep', { path: '/etc' }],
+    ['glob', { path: '/etc' }],
+    ['lsp', { file_path: '/etc/passwd' }],
+    ['present', { files: [{ path: '/etc/passwd' }] }],
+  ]) {
+    assert.match(guard(call(name, args)), /path boundary/, `${name} is fenced by default`)
+  }
+  assert.equal(guard(call('grep', { path: '/workspace/src' })), undefined)
+  assert.equal(guard(call('present', { files: [{ path: '/workspace/a.txt' }] })), undefined)
+  // A tool the table does not name is never inspected.
+  assert.equal(guard(call('notebook_edit', { file_path: '/etc/passwd' })), undefined)
+})
+
+test('an empty table covers nothing, and a replaced table covers exactly itself', () => {
+  // The consequence of replacement, spelled out: the shipped tools are gone.
+  const emptied = guardFor({ pathArguments: {}, pathArrayArguments: {} })
+  assert.equal(emptied(call('read', { file_path: '/etc/passwd' })), undefined)
+  assert.equal(emptied(call('grep', { path: '/etc' })), undefined)
+  assert.equal(emptied(call('present', { files: [{ path: '/etc/passwd' }] })), undefined)
+
+  const one = guardFor({ pathArguments: { notebook_edit: 'file_path' }, pathArrayArguments: {} })
+  assert.match(one(call('notebook_edit', { file_path: '/etc/passwd' })), /path boundary/)
+  assert.equal(one(call('notebook_edit', { file_path: '/workspace/a.md' })), undefined)
+  assert.equal(one(call('grep', { path: '/etc' })), undefined, 'grep is not in the replaced table')
+})
+
+test('a configured array tool is read from the argument the table names', () => {
+  const guards = guardFor({ pathArguments: {}, pathArrayArguments: { attach: 'files' } })
+  assert.match(guards(call('attach', { files: [{ path: '/etc/passwd' }] })), /path boundary/)
+  assert.equal(guards(call('attach', { files: [{ path: '/workspace/a.txt' }] })), undefined)
+  // Naming the wrong argument means the call carries nothing to inspect, so a
+  // misconfigured entry fences nothing.
+  const wrong = guardFor({ pathArguments: {}, pathArrayArguments: { attach: 'items' } })
+  assert.equal(wrong(call('attach', { files: [{ path: '/etc/passwd' }] })), undefined)
+})

@@ -1,0 +1,80 @@
+# dsh-bwrap-sandbox: bubblewrap confinement plus workspace-fenced filesystem tools.
+#
+# Four rows are applied as one bundle layer over dsh-base and the app layer:
+#
+#   1. `sandbox`     — disable the platform sandbox provider (`dsh-sandbox-local`)
+#                      so this bundle's bwrap-only provider registers `ctx.sandbox`.
+#                      The `ctx.sandbox.confine()` consumers (bash, pwsh, the PTY
+#                      shell, and PTC `run_code`) are then confined by it.
+#   2. `bash-sandbox` — disable the stock bash executor so the one that also places
+#                      the tool's `workdir` in the namespace registers `ctx.shell`.
+#                      `confine()` never sees the requested cwd, and bubblewrap
+#                      discards the spawn cwd, so the stock executor starts every
+#                      command in /workspace regardless of what was asked.
+#   3. `fs-sandbox`  — disable the stock filesystem backend so the workspace-fenced
+#                      one registers `ctx.fs` (read, write, edit, and `present`
+#                      all funnel through `ctx.fs.resolve`).
+#   4. `spill-local` — disable the stock spill backend so `/spill` storage registers
+#                      `ctx.spillStore`. The stock one reports a host path as the
+#                      retrieval locator, which names no mount here; this one
+#                      reports `/spill/...`, which the mount table resolves and a
+#                      confined process sees at the same path.
+#   5. inserts       — the bwrap sandbox provider, the fenced filesystem backend,
+#                      the bash executor, the tool-path guard for the tools that
+#                      bypass both (`grep`, `glob`, and `lsp`), and the `/spill`
+#                      backend.
+#
+# `sandbox-policy` stays mounted: it owns the per-session mode and workspace root
+# both providers resolve.
+
+- id: sandbox
+  disabled: true
+
+- id: bash-sandbox
+  disabled: true
+
+- id: fs-sandbox
+  disabled: true
+
+- id: spill-local
+  disabled: true
+
+- insert:
+    - id: bwrap-sandbox
+      name: 'dsh-bwrap-sandbox/sandbox'
+
+    # The four rows below resolve against the same mount table: the session
+    # workspace at /workspace, the stores at /sessions and /attachments, spill
+    # output at /spill, plus `additionalReadOnlyRoots` if an operator adds any.
+    # They are separate plugins with separate config, and the values must agree.
+    - id: bash-bwrap
+      name: 'dsh-bwrap-sandbox/bash'
+      # bash does not exist on Windows, and the base bundle disables the stock
+      # executor there for the same reason.
+      disabled: !!js process.platform === 'win32'
+      config:
+        # Carried over from the `bash-sandbox` row this replaces, so swapping the
+        # executor does not silently change the deployment's timeout.
+        timeoutMs: 60000
+    - id: fs-bwrap
+      name: 'dsh-bwrap-sandbox/fs'
+
+    - id: guard-bwrap
+      name: 'dsh-bwrap-sandbox/guard'
+      # BEGIN GENERATED guard-bwrap config
+      config:
+        pathArguments:
+          read: file_path
+          read_image: file_path
+          write: file_path
+          edit: file_path
+          str_replace_editor: path
+          grep: path
+          glob: path
+          lsp: file_path
+        pathArrayArguments:
+          present: files
+      # END GENERATED guard-bwrap config
+
+    - id: spill-bwrap
+      name: 'dsh-bwrap-sandbox/spill'
