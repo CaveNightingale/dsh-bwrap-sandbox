@@ -36,16 +36,25 @@ import type { SandboxExecutionPolicy } from '@deepseek-ai/dsh-sandbox'
 import type {} from '@deepseek-ai/dsh-sandbox-policy'
 import { assertMountConfig, buildMounts } from './mounts.js'
 import type { MountConfig } from './mounts.js'
-import { FAKE_ROOT, PathDeniedError, VIRTUAL_WORKSPACE, declaredRootFor, hostToVirtual, isUnder, isVirtualPath, mapPath, toVirtualPath, trimSeparator } from './paths.js'
+import { FAKE_ROOT, PathDeniedError, VIRTUAL_WORKSPACE, canonicalizeHostPath, declaredRootFor, hostToVirtual, isUnder, isVirtualPath, mapPath, toVirtualPath, trimSeparator } from './paths.js'
 
 export const name = 'fs-bwrap'
 
 /** Plugin config: the local backend's knobs plus the virtual namespace's mounts. */
-export interface Config extends LocalFileConfig, MountConfig {}
+export interface Config extends LocalFileConfig, MountConfig {
+  /**
+   * Host directory this backend's mount table anchors at, exposed as
+   * `/workspace`; the same fact the `sandbox`, `bash`, and `guard` rows take
+   * under this name, so all four must agree. Empty falls back to the inherited
+   * `cwd`, which stays the base directory for a relative path no caller anchored.
+   */
+  workspace?: string
+}
 
 export const Config: z<Config> = z.intersect([
   LocalFileSystem.Config,
   z.object({
+    workspace: z.string().default(''),
     sessionsRoot: z.string().default(''),
     attachmentsRoot: z.string().default(''),
     spillRoot: z.string().default(''),
@@ -69,7 +78,10 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
   private readonly mountConfig: MountConfig
 
   constructor(ctx: Context, config: Config) {
-    super(ctx, config)
+    // A named `workspace` becomes the inherited base directory, so the mount
+    // table, `processPath`, and the fallback for an unanchored relative path all
+    // name one host directory instead of two.
+    super(ctx, config.workspace ? { ...config, cwd: canonicalizeHostPath(config.workspace) } : config)
     this.mountConfig = {
       sessionsRoot: config.sessionsRoot,
       attachmentsRoot: config.attachmentsRoot,
@@ -102,6 +114,7 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
     const virtualPath = toVirtualPath(path, this.anchor(opts?.cwd, mounts))
     const mapped = this.map(path, virtualPath, mounts)
     const target = await super.resolve(mapped.host, opts)
+    traceResolve(path, mapped.virtual)
     return { targetKey: target.targetKey, displayPath: mapped.virtual }
   }
 
@@ -250,13 +263,17 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
   }
 
   /**
-   * Write through the policy check, except into a mount the deployment made
-   * writable.
+   * Write through this backend's own policy check.
    *
-   * `SandboxedFileSystem` permits a mutation only under the policy's workspace
-   * root and the platform temp areas, and no policy field widens that set — so a
-   * store the operator deliberately exposed as writable has to bypass it here.
-   * Everything else, `read-only` mode included, keeps the inherited check.
+   * `SandboxedFileSystem` permits a mutation only when the target's HOST path
+   * lies under a root it derives from the execution policy — the policy's
+   * workspace root, `/tmp`, and the platform temp directory. In this namespace
+   * that root is an execution-world spelling (`/workspace`) that names no host
+   * directory, so the inherited check denies every write; the host side of the
+   * workspace is the mount table's own. This backend therefore owns the whole
+   * decision — the workspace mount plus the mounts the deployment listed in
+   * `writableRoots` — and falls through to the inherited check for everything
+   * else, keeping its `read-only` behaviour and its message.
    */
   override async writeText(
     target: FsTarget,
@@ -265,14 +282,14 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
     signal?: AbortSignal,
     sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsWriteOutcome> {
-    const inside = await this.insideWritableMount(target, sandboxPolicy)
-    if (inside === undefined) return super.writeText(target, content, expected, signal, sandboxPolicy)
-    return LocalFileSystem.prototype.writeText.call(this, inside, content, expected, signal)
+    const permitted = await this.writableTarget(target, sandboxPolicy)
+    if (permitted === undefined) return super.writeText(target, content, expected, signal, sandboxPolicy)
+    return LocalFileSystem.prototype.writeText.call(this, permitted, content, expected, signal)
   }
 
   /**
-   * Edit through the policy check, with the same writable-mount exception as
-   * {@link writeText}.
+   * Edit through this backend's own policy check, the same one
+   * {@link writeText} applies.
    */
   override async editText(
     target: FsTarget,
@@ -281,37 +298,36 @@ export class WorkspaceFileSystem extends SandboxedFileSystem {
     signal?: AbortSignal,
     sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsEditOutcome> {
-    const inside = await this.insideWritableMount(target, sandboxPolicy)
-    if (inside === undefined) return super.editText(target, edit, expected, signal, sandboxPolicy)
-    return LocalFileSystem.prototype.editText.call(this, inside, edit, expected, signal)
+    const permitted = await this.writableTarget(target, sandboxPolicy)
+    if (permitted === undefined) return super.editText(target, edit, expected, signal, sandboxPolicy)
+    return LocalFileSystem.prototype.editText.call(this, permitted, edit, expected, signal)
   }
 
   /**
-   * Re-canonicalize a mutation target that lies inside a mount configured
-   * writable, and confirm it still does.
+   * Re-canonicalize a mutation target and decide whether this deployment allows
+   * the write.
    *
-   * The fresh resolution is the parent's anti-TOCTOU step: a symlink ancestor
-   * swapped between the tool's own resolve and this call would otherwise move
-   * the write elsewhere. Re-checking against the mount host narrows it here the
-   * same way, and a target that escaped falls back to the inherited policy
-   * check rather than being written.
+   * The writable set is the workspace mount and every mount named in
+   * `writableRoots`, compared on the CANONICAL host path: the fresh resolution
+   * is the anti-TOCTOU step, because a symlink ancestor swapped between the
+   * tool's own resolve and this call would otherwise move the write elsewhere.
+   * A target that escaped the writable host roots, and every mutation in
+   * `read-only` mode, returns `undefined` so the inherited fence reports it.
    *
    * @param target - the resolved target of the pending mutation.
    * @param sandboxPolicy - the per-call policy; omit for the deployment default.
-   * @returns the fresh target inside a writable mount, or `undefined` to use the
-   *   inherited, workspace-only fence.
+   * @returns the fresh target inside a writable mount, or `undefined`.
    */
-  private async insideWritableMount(
+  private async writableTarget(
     target: FsTarget,
     sandboxPolicy?: SandboxExecutionPolicy,
   ): Promise<FsTarget | undefined> {
-    const writable = this.mountConfig.writableRoots ?? []
-    if (writable.length === 0) return undefined
     // `read-only` denies every mutation, this one included.
     const { mode } = sandboxPolicy ?? this.ctx.sandboxPolicy.resolve()
     if (mode !== 'workspace-write') return undefined
-    const hosts = buildMounts(this.config.cwd, this.mountConfig)
-      .filter(mount => writable.includes(mount.virtual))
+    const writable = new Set([VIRTUAL_WORKSPACE, ...(this.mountConfig.writableRoots ?? [])])
+    const hosts = this.mounts()
+      .filter(mount => writable.has(mount.virtual))
       .map(mount => mount.host)
     if (!hosts.some(host => isUnder(target.targetKey, host))) return undefined
     const fresh = await this.resolve(target.displayPath)
@@ -342,8 +358,27 @@ function notFound(requested: string): FsError {
  * @param requested - the path the caller supplied.
  */
 function traceRefusal(requested: string): void {
+  if (process.env.BWRAP_TRACE === undefined) return
   const frames = (new Error().stack ?? '').split('\n').slice(1, 7).map(line => line.trim().replace(/^at /, ''))
   process.stderr.write(`BWRAP_TRACE ${JSON.stringify(requested)}\n${frames.join('\n')}\n\n`)
+}
+
+/**
+ * Diagnostic: report every path the fence resolved, and the name it answered
+ * with.
+ *
+ * A refusal is visible as `not found`, and a *successful* resolution is
+ * invisible — which leaves an operator asking why a loader found nothing with no
+ * way to see what it asked for. This prints that list, so a path the deployment
+ * did not expect (a loader still configured with a host directory, a mount
+ * pointed at the wrong tree) is readable rather than inferred.
+ *
+ * @param requested - the path the caller supplied.
+ * @param virtual - the virtual path it resolved to.
+ */
+function traceResolve(requested: string, virtual: string): void {
+  if (process.env.BWRAP_TRACE_RESOLVE === undefined) return
+  process.stderr.write(`BWRAP_RESOLVE ${JSON.stringify(requested)} -> ${JSON.stringify(virtual)}\n`)
 }
 
 export default WorkspaceFileSystem

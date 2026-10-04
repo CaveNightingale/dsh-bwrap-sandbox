@@ -45,6 +45,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
+    "inspect:skills": "node scripts/inspect-session-skills.mjs",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "sync:patch": "npm run build && node scripts/sync-patch-config.mjs",
     "test": "npm run build && node scripts/check-jsdoc.mjs && node --test"

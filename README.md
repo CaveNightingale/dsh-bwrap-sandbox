@@ -130,6 +130,25 @@ recorded before the namespace existed. Nothing beneath such a root is a name,
 and a path under no root is `not found` like any other path the sandbox does not
 have.
 
+**The launcher has to spell the session cwd this way.** The stock headless runner
+derives it from `fs.processPath(await fs.resolve('.'))`, which is `/workspace`
+here. An app that records a host path instead — a custom launcher, an SDK call
+passing `meta: { cwd: process.cwd() }` — leaves every loader that joins the
+session cwd (project `AGENTS.md`, project skill roots, relative tool paths)
+asking for host paths, which this bundle refuses by design. The symptom is
+silent: no project instructions and no project skills, with the user-level roots
+still working. `npm run inspect:skills` reports which of the two it is:
+
+```sh
+node scripts/inspect-session-skills.mjs ~/.dsh/sessions/…/session.v4.jsonl.zstd --name <skill>
+```
+
+An existing session cannot be repaired — its header already carries the host
+path — so either the launcher is fixed and a new session starts, or the skill
+lives in a user-level root (`~/.agents/skills/<name>/` seen at `/agents/skills`,
+`$DSH_HOME/skills/<name>/` seen at `/skills`), which is mounted regardless of the
+session cwd.
+
 A directory listing is part of the same rule. `listDir` reports every child as
 `<listed directory>/<name>` — the spelling a caller can pass back to any other
 method — instead of the host path the local backend resolves for it, because
@@ -344,9 +363,11 @@ the child would start in a directory that does not exist inside.
 | `dropEnv` | `DSH_HOME`, `DSH_PROFILE_DIR` | Environment names removed from every confined process, because their values name host paths. |
 
 `fs-bwrap` takes the local backend's own config (`cwd`, `diffBasisMaxBytes`) plus
-the mount fields below; its `cwd` is the host workspace directory the mount table
-anchors at, and `processPath` reports that directory as `/workspace`.
-`guard-bwrap` takes the same mount fields plus `workspace`, its host anchor, and
+the mount fields below; `workspace` names the host workspace directory the mount
+table anchors at and `processPath` reports as `/workspace`. Empty `workspace`
+falls back to the inherited `cwd`, which is the same directory and stays the base
+for a relative path no caller anchored. `guard-bwrap` takes the same mount fields
+plus `workspace`, its host anchor, and
 `spill-bwrap` takes `spillRoot`, which must match theirs. They are separate
 plugins with separate configs, so a value set on one has no effect on the others.
 A `spillRoot` that disagrees is the sharpest case: `spill-bwrap` builds a
@@ -362,6 +383,7 @@ surfaces as something missing from the prompt rather than as an error.
 - id: fs-bwrap
   name: 'dsh-bwrap-sandbox/fs'
   config:
+    workspace: ''                 # default: the inherited cwd, keep identical to the bwrap-sandbox row
     sessionsRoot: ''              # default: $DSH_HOME/sessions
     attachmentsRoot: ''           # default: $DSH_HOME/attachments
     spillRoot: ''                 # default: $DSH_HOME/spill
@@ -497,7 +519,16 @@ inspect — see the limitations below.
 
 ### Writable mounts
 
-By default every mount outside the workspace is read-only in both fences. A
+By default every mount outside the workspace is read-only in both fences. This
+backend owns the whole writable set rather than delegating to the inherited
+check, because that check compares a target's **host** path against roots derived
+from the execution policy — and under this namespace the policy's workspace root
+is the execution-world spelling (`/workspace`), which names no host directory.
+The set is the workspace mount plus every mount named in `writableRoots`,
+compared on the canonical host path after a fresh resolution that closes the gap
+between the tool's own resolve and the write. A target outside it, and every
+mutation under `read-only`, still fails with the stock `FS_SANDBOX_DENIED`
+message. A
 deployment that wants the agent to author a skill at the user level flips one
 mount:
 
@@ -600,17 +631,69 @@ against the shipped tables, and each of adding, overriding, and removing a tool
 is exercised through a real registered guard.
 A refused path is silent by design — it reads as `not found` — so the fence can
 print what it refused and who named it. Setting `BWRAP_TRACE=1` writes one block
-per refusal to stderr, with the first frames that reached the fence:
+per refusal to stderr, with the first frames that reached the fence, and
+`BWRAP_TRACE_RESOLVE=1` writes one line per *successful* resolution, because a
+loader that found the wrong tree reports nothing at all:
 
 ```sh
 BWRAP_TRACE=1 dsh --profile <name> "task"
+BWRAP_TRACE_RESOLVE=1 dsh --profile <name> "task"
 ```
 
-That is how the current wiring was checked: a whole session — skills, both
+That is how the current wiring was checked. A whole session — skills, both
 instruction files, the policy line, a confined `bash` call — produced exactly one
 refusal, `/.git` from `skill-filesystem`'s upward project-root walk, which is a
-virtual path at the namespace root and the walk's expected termination. No host
-path reached `ctx.fs`.
+virtual path at the namespace root and the walk's expected termination, and this
+resolution list:
+
+```text
+/workspace/.dsh/skills                         /workspace/.dsh/skills/proj-dsh/SKILL.md
+/workspace/.agents/skills                      /workspace/.agents/skills/proj-agents/SKILL.md
+/skills                                        /skills/local/SKILL.md
+/agents/skills                                 /agents/skills/demo/SKILL.md
+/workspace/AGENTS.md                           /workspace/AGENTS.local.md
+/AGENTS.md
+```
+
+No host path reached `ctx.fs`, and no host path was refused from a caller that
+should have named a virtual one.
+
+The skill catalog was measured the same way: a session whose `write` call created
+`/workspace/.agents/skills/probe-skill/SKILL.md` emitted the `<available_skills>`
+reminder twice — `demo, local, proj-agents, proj-dsh` before the write and
+`demo, local, probe-skill, proj-agents, proj-dsh` after it — which is the
+invalidation path working, and the same reminder never changes for a skill
+created with `bash`.
+
+`npm run inspect:skills` answers it by RUNNING the loader: it mounts the real
+`dsh-skill` registry and the real `dsh-skill-filesystem` provider over this
+bundle's real backend, asks for the catalog with the session's cwd, and prints
+both the answer and every path the provider requested — including the refusals,
+which the loader itself can only see as absence.
+
+```sh
+node scripts/inspect-session-skills.mjs ~/.dsh/sessions/…/session.v4.jsonl.zstd
+```
+
+The same probe with two cwds, against one deployment, is the whole diagnosis: a
+session whose cwd is `/workspace` gets five skills and one refusal (`/.git`, the
+project walk's end), while one whose cwd is a host path gets only the two
+user-level skills and seven refusals — the project roots among them:
+
+```text
+REFUSED resolve /home/deepseek/workspace/.agents/skills  ->  FS_NOT_FOUND: cannot access …
+```
+
+An existing session cannot be repaired: its header already carries the host path,
+so either the launcher is fixed and a new session starts, or the skill lives in a
+user-level root (`~/.agents/skills/<name>/`, seen at `/agents/skills`, or
+`$DSH_HOME/skills/<name>/`, seen at `/skills`), which is mounted regardless of the
+session cwd.
+
+The probe also prints the `<available_skills>` reminders the log recorded, which
+is what tells the freshness question apart from the root question: a skill
+created through `write` or `edit` appears in a later reminder, and one created
+with `bash` does not.
 ## Known limitations
 
 - **Linux only, and fail-closed.** Bubblewrap is the sole backend. On another
@@ -690,6 +773,24 @@ path reached `ctx.fs`.
   the filesystem backend, which cannot see `grep`, `glob`, `lsp`, `bash`,
   `pwsh`, or `terminal` — the tools only this guard covers — and a host path must
   not be nameable there either.
+- **A skill created during a session is announced only when the `write` or `edit`
+  tool creates it.** `skill-filesystem` rebuilds its catalog on two signals: a
+  host chokidar watcher rooted at each skill root, and a first-party mutation
+  hook that fires for `write`/`edit` through `ctx.fs`. The watcher cannot work
+  here — the roots are virtual paths that exist only inside the sandbox, so it
+  walks up to the host's `/` and waits for a first segment that never appears
+  (`node scripts/inspect-session-skills.mjs --watch-anchor /workspace/.agents/skills`
+  prints that walk). A skill authored with `bash` therefore stays invisible to
+  the `skill` tool until the session restarts, while one written with the `write`
+  tool appears on the next request.
+- **A consumer that treats the policy's workspace root as a host path sees
+  `/workspace`.** The field's contract says the root is spelled the way the
+  execution world spells it, and the sandboxed consumers want that: the PTY
+  shell, the shell tool's default workdir, and the BFF's workspace scope are all
+  correct with it. The stock filesystem fence is not — which is why
+  `fs-bwrap` owns its own writable set — and the PTC runtime spawns its child
+  with `cwd = policy.workspaceRoot`, a directory that does not exist on the host.
+  `run_code` is not part of this bundle's profile, so that one is untested here.
 - **`writableRoots` must list the same mounts on `bwrap-sandbox` and
   `fs-bwrap`.** They are separate plugins and nothing checks the agreement. A
   mount writable only in the profile fails at the tool fence, one writable only
@@ -734,10 +835,33 @@ direction — the tools learn about a tree the sandbox already cannot reach —
   cwd from `fs.processPath`, so sessions are keyed under
   `$DSH_HOME/sessions/--workspace--/` instead of a directory named after the host
   project, and a session recorded earlier carries the host path in its header.
-  Resuming one of those under the headless runner fails loudly — it compares the
-  recorded cwd with the one it computed — and its stored files are in the older
-  directory. The fences still accept a session whose root IS the configured
-  workspace, so such a session runs; it just cannot be adopted by the runner.
+  Resuming one of those fails loudly in two independent places: the runner
+  compares the recorded cwd with the one it computed (`was recorded in
+  "<host>", not "/workspace"`), and the store requires the log to sit at the path
+  its header names (`header id "…" and cwd identify "…"`). The fences do accept a
+  session whose root is the configured workspace, so such a session runs as far
+  as the tools are concerned; only adoption fails.
+
+  Rewriting the header repairs it. The log is a sequence of zstd frames with the
+  header alone in the first, which is why recompressing the whole file as one
+  frame reads as `corrupt Zstandard session log: first frame is not exactly one
+  header line`:
+
+  ```sh
+  zstd -dc "$LOG" > /tmp/all.jsonl
+  head -1 /tmp/all.jsonl | sed 's#"cwd":"[^"]*"#"cwd":"/workspace"#' > /tmp/h.jsonl
+  tail -n +2 /tmp/all.jsonl > /tmp/rest.jsonl
+  mkdir -p "$DSH_HOME/sessions/--workspace--/$ID"   # the path the store names in its error
+  { zstd -q -c /tmp/h.jsonl; zstd -q -c /tmp/rest.jsonl; } \
+    > "$DSH_HOME/sessions/--workspace--/$ID/session.v4.jsonl.zstd"
+  rm -rf "$DSH_HOME/sessions/<old project key>/$ID"
+  ```
+
+  Measured on a repaired session: `--session-id` adopts it, a relative `write`
+  resolves under the mounts, and the tool reports `<path>/workspace/...` with the
+  file landing in the host workspace. Past events keep the host spellings they
+  recorded (`bash` workdirs, tool-result paths); those are transcript content, and
+  only the turns that follow are spelled in the namespace.
 - **Harness components that treat the session cwd as a host path see
   `/workspace`.** The contract says the cwd is an execution-world path, and the
   sandboxed consumers want it that way: a PTY's start directory, a PTC child's

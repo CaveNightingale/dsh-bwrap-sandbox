@@ -95,6 +95,27 @@ test('a virtual path and a relative path resolve to the virtual view, and a host
   })
 })
 
+test('the workspace field, not the inherited cwd, anchors this backend mount table', async () => {
+  // A decoy would swallow the write if the base class kept the inherited `cwd`
+  // as its mount source; the two fields name one fact, and `workspace` is the
+  // name all four rows share.
+  await withFixture([], async ({ workspace, backend }) => {
+    assert.equal((await backend.resolve('/workspace/src/a.txt')).targetKey, join(workspace, 'src', 'a.txt'))
+    assert.equal(await backend.processPath(await backend.resolve('/workspace/src/a.txt')), '/workspace/src/a.txt')
+  }, { cwd: join(tmpdir(), 'bwrap-decoy-that-does-not-exist') })
+})
+
+test('the workspace field, not the inherited cwd, anchors this backend mount table', async () => {
+  // The decoy does not exist, so a base class still anchored on the inherited
+  // `cwd` would resolve nothing: the two fields name one fact, and `workspace`
+  // is the name all four rows share.
+  await withFixture([], async ({ workspace, backend }) => {
+    const target = await backend.resolve('/workspace/src/a.txt')
+    assert.equal(target.targetKey, join(workspace, 'src', 'a.txt'))
+    assert.equal(await backend.processPath(target), '/workspace/src/a.txt')
+  }, { cwd: join(tmpdir(), 'bwrap-decoy-that-does-not-exist') })
+})
+
 test('an alias outside the mounts that resolves into the workspace reads as absent', async () => {
   await withFixture([], async ({ root, backend, guard, call }) => {
     const aliased = join(root, 'outside', 'ws', 'src', 'a.txt')
@@ -289,6 +310,72 @@ test('a writable root accepts a write the policy would deny, and an unlisted one
     await assert.rejects(
       writable.writeText(authored, 'no\n', undefined, undefined, { mode: 'read-only', workspaceRoot: workspace }),
       denied,
+    )
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+})
+
+test('the workspace stays writable when the policy root is an execution-world path', async t => {
+  // The policy spells the workspace the way the execution world does, which is
+  // what a session reports. The inherited fence compares that string against
+  // host paths and would deny every write, so this backend owns the decision.
+  // The tree lives outside `tmpdir()` for the same reason as the test above: the
+  // inherited fence allows the platform temp areas.
+  let root
+  try {
+    root = mkdtempSync('/var/tmp/bwrap-policy-root-')
+  } catch (error) {
+    t.skip(`no /var/tmp on this host (${String(error)})`)
+    return
+  }
+  const skills = join(root, 'skills')
+  const workspace = join(root, 'ws')
+  mkdirSync(join(skills, 'local'), { recursive: true })
+  mkdirSync(workspace)
+  const context = new Context()
+  context.provide('sandboxPolicy', { defaultMode: 'workspace-write' })
+  const backend = new WorkspaceFileSystem(context, {
+    cwd: workspace,
+    diffBasisMaxBytes: 10 * 1024 * 1024,
+    sessionsRoot: '',
+    attachmentsRoot: '',
+    agentsHome: join(root, 'agents'),
+    skillsRoot: skills,
+    userInstructionsFile: join(root, 'AGENTS.md'),
+    additionalReadOnlyRoots: [],
+  })
+  const policy = { mode: 'workspace-write', workspaceRoot: '/workspace' }
+
+  try {
+    const created = await backend.resolve('/workspace/note.md')
+    await backend.writeText(created, 'first\n', undefined, undefined, policy)
+    assert.equal(readFileSync(join(workspace, 'note.md'), 'utf8'), 'first\n')
+
+    await backend.editText(
+      created,
+      { oldString: 'first', newString: 'second', replaceAll: false },
+      undefined,
+      undefined,
+      policy,
+    )
+    assert.equal(readFileSync(join(workspace, 'note.md'), 'utf8'), 'second\n')
+
+    // A mount the deployment did not make writable is still refused, and so is
+    // every mutation under `read-only`.
+    await assert.rejects(
+      backend.writeText(await backend.resolve('/skills/local/note.md'), 'no\n', undefined, undefined, policy),
+      error => {
+        assert.equal(error.code, 'FS_SANDBOX_DENIED')
+        return true
+      },
+    )
+    await assert.rejects(
+      backend.writeText(created, 'no\n', undefined, undefined, { mode: 'read-only', workspaceRoot: '/workspace' }),
+      error => {
+        assert.equal(error.code, 'FS_SANDBOX_DENIED')
+        return true
+      },
     )
   } finally {
     rmSync(root, { recursive: true, force: true })
