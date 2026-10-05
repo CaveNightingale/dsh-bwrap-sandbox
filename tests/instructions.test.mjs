@@ -45,7 +45,7 @@ async function withSession(body) {
     agentsHome: join(home, '.agents'),
     skillsRoot: join(dshHome, 'skills'),
     userInstructionsFile: join(dshHome, 'AGENTS.md'),
-    additionalReadOnlyRoots: [],
+    additionalReadOnlyRoots: {},
   })
   try {
     await body({ root, home, dshHome, workspace, backend })

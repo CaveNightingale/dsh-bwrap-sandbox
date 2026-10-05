@@ -23,7 +23,7 @@ import z from '@deepseek-ai/schemastery'
 import { sandboxDenialMarker, SandboxProvider, SandboxUnavailableError, canonicalPath } from '@deepseek-ai/dsh-sandbox'
 import type { ConfinedArgv, SandboxPolicy } from '@deepseek-ai/dsh-sandbox'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
-import { defaultAgentsHome, USER_INSTRUCTIONS_FILE } from './mounts.js'
+import { assertMountConfig, defaultAgentsHome, extraRootName, USER_INSTRUCTIONS_FILE } from './mounts.js'
 import {
   trimSeparator,
   VIRTUAL_AGENTS,
@@ -51,6 +51,18 @@ export interface Config {
    * but ephemeral and hold no host data.
    */
   maskedRoots?: string[]
+  /**
+   * Further host directories bound read-only as `{ <name>: <host directory> }`,
+   * the same map `fs-bwrap` and `guard-bwrap` take.
+   *
+   * The key is the mount point and the value is the host directory behind it, so
+   * a nested host directory such as `/home/deepseek/my_files` is bound at a name
+   * of the operator's choosing (`my_files:` → `/my_files`) instead of under its
+   * host path. The key is one top-level segment, with or without its leading
+   * slash. Must match the other rows' map, or the tools and the sandbox disagree
+   * about the same directory.
+   */
+  additionalReadOnlyRoots?: Record<string, string>
   /** Host session-log directory exposed read-only at `/sessions`; empty resolves `$DSH_HOME/sessions`. */
   sessionsRoot?: string
   /** Host attachment store exposed read-only at `/attachments`; empty resolves `$DSH_HOME/attachments`. */
@@ -104,8 +116,7 @@ export interface Config {
 }
 
 export const Config: z<Config> = z.object({
-  systemReadOnlyRoots: z.array(z.string()).default(['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc', '/opt']),
-  maskedRoots: z.array(z.string()).default(['/home', '/root']),
+  systemReadOnlyRoots: z.array(z.string()).default(['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc', '/opt']),  maskedRoots: z.array(z.string()).default(['/home', '/root']),
   workspace: z.string().default(''),
   sessionsRoot: z.string().default(''),
   attachmentsRoot: z.string().default(''),
@@ -147,6 +158,8 @@ function bindIfPresent(args: string[], source: string, virtual: string, writable
 interface ResolvedConfig {
   systemReadOnlyRoots: readonly string[]
   maskedRoots: readonly string[]
+  /** Further read-only binds, resolved to a mount point and its host directory. */
+  additionalReadOnlyRoots: readonly { at: string; host: string }[]
   /** Canonical host directory bound at {@link VIRTUAL_WORKSPACE}. */
   workspace: string
   sessionsRoot: string
@@ -205,6 +218,10 @@ export function profileArgs(policy: SandboxPolicy, config: ResolvedConfig): stri
 
   if (config.privateTmp) args.push('--tmpfs', '/tmp')
 
+  for (const extra of config.additionalReadOnlyRoots) {
+    bindIfPresent(args, extra.host, extra.at, writable.has(extra.at))
+  }
+
   args.push(workspaceWritable ? '--bind' : '--ro-bind', policy.workspaceRoot, VIRTUAL_WORKSPACE)
 
   // The caller spawns with its own cwd — the host workspace path — applied
@@ -233,12 +250,17 @@ export class BwrapSandboxProvider extends SandboxProvider {
 
   constructor(ctx: Context, config: Config) {
     super(ctx)
+    // Fail at load for a nested mount name, a non-absolute host directory, or a
+    // name two mounts claim — the same rules the tool-side rows enforce.
+    assertMountConfig(config)
     const sessionsRoot = (config.sessionsRoot as string) || dshHomePath('sessions')
     const attachmentsRoot = (config.attachmentsRoot as string) || dshHomePath('attachments')
     const spillRoot = (config.spillRoot as string) || dshHomePath('spill')
     this.resolved = {
       systemReadOnlyRoots: (config.systemReadOnlyRoots as string[]).map(trimSeparator),
       maskedRoots: (config.maskedRoots as string[]).map(trimSeparator),
+      additionalReadOnlyRoots: Object.entries((config.additionalReadOnlyRoots as Record<string, string>) ?? {})
+        .map(([name, host]) => ({ at: extraRootName(name), host: trimSeparator(host) })),
       workspace: canonicalPath((config.workspace as string) || process.cwd()),
       // The stores the model may read through /sessions, /attachments, and /spill.
       sessionsRoot,

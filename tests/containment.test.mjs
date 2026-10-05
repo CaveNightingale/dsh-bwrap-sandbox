@@ -10,11 +10,11 @@ import { apply as applyGuard } from '../lib/guard.js'
 /**
  * Build a workspace with the alias shapes the fence must separate, wiring the
  * real backend and the real guard the way the profile does.
- * @param extraRoots - `additionalReadOnlyRoots` for both plugins.
+ * @param extraRoots - `additionalReadOnlyRoots` for both plugins, as a name → host map.
  * @param overrides - further settings, such as `writableRoots`.
  * @returns the temp root, the backend, the guard, and a tool-call builder.
  */
-function fixture(extraRoots = [], overrides = {}) {
+function fixture(extraRoots = {}, overrides = {}) {
   const root = mkdtempSync(join(tmpdir(), 'bwrap-fence-'))
   const workspace = join(root, 'ws')
   mkdirSync(join(workspace, 'src'), { recursive: true })
@@ -64,12 +64,14 @@ function fixture(extraRoots = [], overrides = {}) {
 
 /**
  * Run `body` against a fixture and clean up afterwards.
- * @param extraRoots - `additionalReadOnlyRoots`.
+ * @param extraRoots - `additionalReadOnlyRoots`, as a name → host map.
  * @param body - receives the fixture; it is awaited before cleanup.
  * @param overrides - further settings, such as `writableRoots`.
  */
 async function withFixture(extraRoots, body, overrides = {}) {
-  const context = fixture(extraRoots, overrides)
+  // The plugin schema takes a map; a call site that adds no extra root spells it
+  // as an empty array, which is the same statement.
+  const context = fixture(Array.isArray(extraRoots) && extraRoots.length === 0 ? {} : extraRoots, overrides)
   try {
     await body(context)
   } finally {
@@ -114,6 +116,19 @@ test('the workspace field, not the inherited cwd, anchors this backend mount tab
     assert.equal(target.targetKey, join(workspace, 'src', 'a.txt'))
     assert.equal(await backend.processPath(target), '/workspace/src/a.txt')
   }, { cwd: join(tmpdir(), 'bwrap-decoy-that-does-not-exist') })
+})
+
+test('a harness-host path maps into the namespace, descendants included', async () => {
+  // The direction a plugin needs when it holds a host path — a configured
+  // workspace, an attachment on disk — and has to name the same file in the
+  // world the session runs in. A path no mount covers has no name here, and the
+  // mapping agrees with `processPath` applied to the resolved target.
+  await withFixture([], async ({ workspace, backend }) => {
+    assert.equal(backend.processPathFromHostPath(workspace), '/workspace')
+    assert.equal(backend.processPathFromHostPath(join(workspace, 'src', 'a.txt')), '/workspace/src/a.txt')
+    assert.equal(backend.processPathFromHostPath('/etc/passwd'), undefined)
+    assert.equal(backend.processPath(await backend.resolve('/workspace/src/a.txt')), '/workspace/src/a.txt')
+  })
 })
 
 test('an alias outside the mounts that resolves into the workspace reads as absent', async () => {
@@ -173,7 +188,9 @@ test('the user-level agents home and DSH skill root are reachable under their vi
 
     assert.equal(guard(call('read', { file_path: '/agents/skills/demo/SKILL.md' })), undefined)
     assert.equal(guard(call('read', { file_path: '/skills/local/SKILL.md' })), undefined)
-    assert.match(guard(call('read', { file_path: hostSkill })), /is a host path/)
+    // Refused like an absent path: the answer repeats the caller's own argument
+    // and says nothing about the name the sandbox has the same file under.
+    assert.equal(guard(call('read', { file_path: hostSkill })), `cannot access ${JSON.stringify(hostSkill)}: not found`)
   })
 })
 
@@ -192,8 +209,10 @@ test('the user-global instruction file reads as absent until it exists', async (
     assert.equal(present.targetKey, join(root, 'AGENTS.md'))
     assert.equal((await backend.stat(present)).type, 'file')
     assert.equal(guard(call('read', { file_path: '/AGENTS.md' })), undefined)
-    // Its host spelling is not a name this session has.
-    assert.match(guard(call('read', { file_path: join(root, 'AGENTS.md') })), /is a host path/)
+    // Its host spelling gets the absent-path answer, with no hint that the file
+    // exists under another name.
+    const hostSpelled = join(root, 'AGENTS.md')
+    assert.equal(guard(call('read', { file_path: hostSpelled })), `cannot access ${JSON.stringify(hostSpelled)}: not found`)
   })
 })
 
@@ -228,25 +247,36 @@ test('the read-only stores stay reachable and workspace calls stay allowed', asy
   })
 })
 
-test('an extra root admits that tree, and nothing outside it', async () => {
-  await withFixture([tmpdir()], async ({ root, workspace, backend, guard, call }) => {
-    const spill = join(tmpdir(), 'bwrap-spill-probe.txt')
-    assert.equal((await backend.resolve(spill)).displayPath, spill)
-    assert.equal(guard(call('read', { file_path: spill })), undefined)
-    // The alias now names a path inside the extra root, so it is followed — and
-    // lands on the workspace file it already pointed at, granting no new tree.
-    assert.equal((await backend.resolve(join(root, 'outside', 'ws', 'src', 'a.txt'))).targetKey, join(workspace, 'src', 'a.txt'))
+test('an extra root admits that tree at the name it was given, and nothing outside it', async () => {
+  // The host directory is nested and names nothing in the namespace; the key is
+  // the name it takes there.
+  await withFixture({ scratch: tmpdir() }, async ({ root, workspace, backend, guard, call }) => {
+    assert.equal((await backend.resolve('/scratch/bwrap-spill-probe.txt')).displayPath, '/scratch/bwrap-spill-probe.txt')
+    assert.equal(guard(call('read', { file_path: '/scratch/bwrap-spill-probe.txt' })), undefined)
+    // The host directory names nothing here, so the same file is unreachable
+    // under the path it has on the host.
+    const hostSpelling = join(tmpdir(), 'bwrap-spill-probe.txt')
+    await assert.rejects(backend.resolve(hostSpelling), error => error.code === 'FS_NOT_FOUND')
+    assert.equal(guard(call('read', { file_path: hostSpelling })), `cannot access ${JSON.stringify(hostSpelling)}: not found`)
     assert.match(guard(call('read', { file_path: '/etc/passwd' })), /not found/)
   })
 })
 
-test('an extra root that is not a single top-level directory fails loud at load', () => {
+test('an extra root whose key or host directory is unusable fails loud at load', () => {
   const context = new Context()
   context.provide('tools', { guard: () => {} })
-  assert.throws(
-    () => applyGuard(context, { additionalReadOnlyRoots: ['/var/tmp'] }),
-    /must be a single top-level directory/,
-  )
+  const cases = [
+    [{ 'var/tmp': '/var/tmp' }, /must be a single top-level name/],
+    [{ '..': '/tmp' }, /must be a single top-level name/],
+    [{ scratch: 'relative/path' }, /must be an absolute host directory/],
+    [{ scratch: '' }, /must be an absolute host directory/],
+    // A second mount at one path would replace the first silently.
+    [{ workspace: '/var/tmp' }, /named by two mounts/],
+    [{ tmp: '/var/tmp' }, /named by two mounts/],
+  ]
+  for (const [roots, expected] of cases) {
+    assert.throws(() => applyGuard(context, { additionalReadOnlyRoots: roots }), expected)
+  }
 })
 
 test('a writable root accepts a write the policy would deny, and an unlisted one does not', async t => {
@@ -274,7 +304,7 @@ test('a writable root accepts a write the policy would deny, and an unlisted one
     agentsHome: agents,
     skillsRoot: skills,
     userInstructionsFile: join(root, 'AGENTS.md'),
-    additionalReadOnlyRoots: [],
+    additionalReadOnlyRoots: {},
   }
   const backendFor = writableRoots => {
     const context = new Context()
@@ -403,7 +433,7 @@ test('the backend resolves /spill to its configured spillRoot', async () => {
       sessionsRoot: '',
       attachmentsRoot: '',
       spillRoot,
-      additionalReadOnlyRoots: [],
+      additionalReadOnlyRoots: {},
     })
     // A row that forgets to forward spillRoot resolves the locator to the
     // default $DSH_HOME/spill instead, while spill-bwrap writes elsewhere.

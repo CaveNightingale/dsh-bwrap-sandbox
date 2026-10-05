@@ -10,7 +10,7 @@
  */
 
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { dshHomePath } from '@deepseek-ai/dsh-home-paths'
 import {
   canonicalizeHostPath,
@@ -54,10 +54,18 @@ export interface MountConfig {
    */
   userInstructionsFile?: string
   /**
-   * Further host directories exposed under their own path. Each entry is one
-   * top-level directory, because a virtual mount is a single name.
+   * Further host directories exposed read-only, as `{ <name>: <host directory> }`.
+   *
+   * The key is the namespace name and the value is the host directory behind it,
+   * because the two are separate facts: a mount point is one name created on the
+   * namespace root, while the host directory may be nested
+   * (`my_files: /home/deepseek/my_files`) and has no single-segment name of its
+   * own. The key is a single top-level segment, with or without its leading
+   * slash (`my_files` and `/my_files` both mean `/my_files`); anything nested
+   * fails at load, because a virtual mount is one name and a read-only bind
+   * cannot host a mount point inside it.
    */
-  additionalReadOnlyRoots?: string[]
+  additionalReadOnlyRoots?: Record<string, string>
   /**
    * Virtual mounts a confined process and the file tools may WRITE to, named as
    * their virtual roots (`/agents`, `/skills`, `/AGENTS.md`, an extra root).
@@ -75,7 +83,23 @@ export interface MountConfig {
 }
 
 /** A virtual mount name: exactly one top-level segment, no descendants. */
-const MOUNT_NAME = /^\/[^/]+$/
+const MOUNT_NAME = /^\/(?!\.{1,2}$)[^/]+$/
+
+/**
+ * The namespace path an additional root's key names.
+ * @param name - the configured key, with or without its leading slash.
+ * @returns the absolute single-segment path.
+ * @throws when the key is empty, nested, or names the namespace root.
+ */
+export function extraRootName(name: string): string {
+  const at = name.startsWith('/') ? name : `/${name}`
+  if (!MOUNT_NAME.test(at)) {
+    throw new Error(
+      `bwrap-sandbox: additionalReadOnlyRoots key ${JSON.stringify(name)} must be a single top-level name such as "my_files" or "/tmp"`,
+    )
+  }
+  return at
+}
 
 /**
  * Every virtual root {@link buildMounts} can produce for this config.
@@ -91,7 +115,7 @@ function virtualRoots(config: MountConfig): string[] {
     VIRTUAL_AGENTS,
     VIRTUAL_SKILLS,
     VIRTUAL_USER_INSTRUCTIONS,
-    ...(config.additionalReadOnlyRoots ?? []),
+    ...Object.keys(config.additionalReadOnlyRoots ?? {}).map(extraRootName),
   ]
 }
 
@@ -132,14 +156,24 @@ export function defaultAgentsHome(): string {
  *   writable root names no mount.
  */
 export function assertMountConfig(config: MountConfig): void {
-  for (const root of config.additionalReadOnlyRoots ?? []) {
-    if (!MOUNT_NAME.test(root)) {
+  for (const [name, host] of Object.entries(config.additionalReadOnlyRoots ?? {})) {
+    extraRootName(name)
+    if (host.length === 0 || !isAbsolute(host)) {
       throw new Error(
-        `bwrap-sandbox: additionalReadOnlyRoots entry ${JSON.stringify(root)} must be a single top-level directory such as "/tmp"`,
+        `bwrap-sandbox: additionalReadOnlyRoots["${name}"] must be an absolute host directory, got ${JSON.stringify(host)}`,
       )
     }
   }
   const roots = virtualRoots(config)
+  // One name, one mount: a second mount at the same path would replace the first
+  // in the sandbox and shadow it in the mount table, silently.
+  const taken = new Set<string>(['/tmp'])
+  for (const name of roots) {
+    if (taken.has(name)) {
+      throw new Error(`bwrap-sandbox: ${JSON.stringify(name)} is named by two mounts; pick another additionalReadOnlyRoots name`)
+    }
+    taken.add(name)
+  }
   for (const name of config.writableRoots ?? []) {
     if (!roots.includes(name)) {
       throw new Error(
@@ -167,9 +201,9 @@ export function buildMounts(workspaceHost: string, config: MountConfig = {}): Mo
     { host: canonicalizeHostPath(config.skillsRoot || dshHomePath('skills')), virtual: VIRTUAL_SKILLS },
     // A single file, not its parent: `$DSH_HOME` also holds credentials.
     { host: canonicalizeHostPath(config.userInstructionsFile || dshHomePath(USER_INSTRUCTIONS_FILE)), virtual: VIRTUAL_USER_INSTRUCTIONS },
-    ...(config.additionalReadOnlyRoots ?? []).map(root => ({
-      host: canonicalizeHostPath(root),
-      virtual: root,
+    ...Object.entries(config.additionalReadOnlyRoots ?? {}).map(([name, host]) => ({
+      host: canonicalizeHostPath(host),
+      virtual: extraRootName(name),
     })),
   ]
 }

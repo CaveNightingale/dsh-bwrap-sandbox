@@ -117,7 +117,7 @@ export const Config: z<Config> = z.object({
   agentsHome: z.string().default(''),
   skillsRoot: z.string().default(''),
   userInstructionsFile: z.string().default(''),
-  additionalReadOnlyRoots: z.array(z.string()).default([]),
+  additionalReadOnlyRoots: z.dict(z.string()).default({}),
   writableRoots: z.array(z.string()).default([]),
   pathArguments: z.dict(z.string()).default({ ...DEFAULT_PATH_ARGUMENTS }),
   pathArrayArguments: z.dict(z.string()).default({ ...DEFAULT_PATH_ARRAY_ARGUMENTS }),
@@ -229,10 +229,14 @@ export function apply(ctx: Context, config: Config): void {
       // but those never reach a model: every result presents `displayPath`.
       // Accepting one here would give the model two names for one file, of
       // which only one exists inside `bash`.
+      //
+      // The refusal is the same one any path the sandbox does not have gets, down
+      // to its wording: a distinct answer — naming the visible path, or saying
+      // the argument was host-spelled — would tell the caller which of its
+      // guesses named a real host file and where that file lives in the
+      // namespace. This reply reveals neither.
       const virtual = hostToVirtual(candidate, mounts)
-      if (virtual !== undefined && virtual !== candidate) {
-        return hostSpelling(candidate, virtual)
-      }
+      if (virtual !== undefined && virtual !== candidate) return notFound(candidate)
       const virtualPath = virtual ?? toVirtualPath(candidate, VIRTUAL_WORKSPACE)
       try {
         const mapped = mapPath(virtualPath, mounts)
@@ -256,27 +260,13 @@ export function apply(ctx: Context, config: Config): void {
  * filesystem without passing through `ctx.fs`, so only this check stands in
  * front of them. The wording is the namespace's answer rather than a boundary
  * report: a path the sandbox does not have reads as missing, the way it does for
- * the backend, and the fence's shape is not disclosed to the model.
+ * the backend, and the fence's shape is not disclosed to the model. A host
+ * spelling gets this same message, so the answer never says whether the caller
+ * named a file the sandbox has under another name.
  *
  * @param candidate - the tool's argument, for the message.
  * @returns the denial reason.
  */
 function notFound(candidate: string): string {
   return `cannot access ${JSON.stringify(candidate)}: not found`
-}
-
-/**
- * The message a host-spelled argument gets, naming the path the sandbox shows.
- *
- * Unlike {@link notFound} this discloses a path, because the caller named the
- * host spelling itself and the namespace's answer is what every other result
- * already displays. A model that keeps the host name would read the same file
- * under `read` and fail to find it under `bash`.
- *
- * @param candidate - the tool's argument, for the message.
- * @param virtual - the path the same file has in the sandbox.
- * @returns the denial reason.
- */
-function hostSpelling(candidate: string, virtual: string): string {
-  return `path boundary: ${JSON.stringify(candidate)} is a host path; the sandbox has it at ${JSON.stringify(virtual)}`
 }

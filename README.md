@@ -111,12 +111,22 @@ working directory is the one the filesystem provider reports through
 `processPath` — `/workspace` here — so the harness itself spells paths the way
 the sandbox does: the persona's `{{cwd}}`, the runtime-context policy line, the
 instruction loaders, the skill loaders, and every tool argument. A host path in
-a **tool argument** is refused outright, naming the path the sandbox shows:
+a **tool argument** is refused outright, with the same answer any path the
+sandbox does not have gets:
 
 ```text
 read file_path=/home/deepseek/workspace/notes.md
-→ path boundary: "/home/deepseek/workspace/notes.md" is a host path; the sandbox has it at "/workspace/notes.md"
+→ cannot access "/home/deepseek/workspace/notes.md": not found
+read file_path=/etc/passwd
+→ cannot access "/etc/passwd": not found
 ```
+
+One answer, because a distinct one would be an oracle. Naming the sandbox's path
+for the same file, or saying the argument was a host spelling at all, would
+confirm which guess named a real host file and where that file lives in the
+namespace — and it would do so in a message the session log keeps, which can be
+exported or quoted back by the model. The reply repeats the caller's own argument
+and nothing more.
 
 `ctx.fs.resolve` and `ctx.fs.lstat` fence `read`, `read_image`, `write`, `edit`,
 `str_replace_editor`, and `present`; `guard-bwrap` applies the same walk and the
@@ -335,6 +345,9 @@ the child would start in a directory that does not exist inside.
   config:
     systemReadOnlyRoots: ['/usr', '/lib', '/lib64', '/bin', '/sbin', '/etc', '/opt']
     maskedRoots: ['/home', '/root']
+    # Further read-only mounts, as <name in the namespace>: <host directory>.
+    # additionalReadOnlyRoots:
+    #   my_files: /home/deepseek/my_files   # -> /my_files
     workspace: ''             # default: the process working directory
     sessionsRoot: ''          # default: $DSH_HOME/sessions
     attachmentsRoot: ''       # default: $DSH_HOME/attachments
@@ -391,7 +404,7 @@ surfaces as something missing from the prompt rather than as an error.
     skillsRoot: ''                # default: $DSH_HOME/skills
     userInstructionsFile: ''      # default: $DSH_HOME/AGENTS.md
     writableRoots: []             # keep identical to the bwrap-sandbox row
-    additionalReadOnlyRoots: []
+    additionalReadOnlyRoots: {}   # keep identical to the bwrap-sandbox row
 
 - id: guard-bwrap
   name: 'dsh-bwrap-sandbox/guard'
@@ -404,7 +417,7 @@ surfaces as something missing from the prompt rather than as an error.
     skillsRoot: ''                # keep identical to the fs-bwrap row
     userInstructionsFile: ''      # keep identical to the fs-bwrap row
     writableRoots: []             # validated here, acted on by fs-bwrap
-    additionalReadOnlyRoots: []
+    additionalReadOnlyRoots: {}   # keep identical to the bwrap-sandbox row
 
 - id: spill-bwrap
   name: 'dsh-bwrap-sandbox/spill'
@@ -423,7 +436,7 @@ surfaces as something missing from the prompt rather than as an error.
 | `skillsRoot` | `$DSH_HOME/skills` | Host user-level DSH skill root, exposed read-only at `/skills`. |
 | `userInstructionsFile` | `$DSH_HOME/AGENTS.md` | Host user-global instruction file, exposed read-only at `/AGENTS.md`. |
 | `writableRoots` | `[]` | Virtual mounts the file tools may write inside, e.g. `['/agents']`. Only `fs-bwrap` acts on it; the other rows validate the name so a typo fails at load. |
-| `additionalReadOnlyRoots` | `[]` | Extra host directories mounted as further virtual roots under their own path. Each entry must be a single top-level directory (`/tmp`, not `/var/tmp`), because a virtual mount is one name; anything else fails at load rather than becoming an unreachable directory. |
+| `additionalReadOnlyRoots` | `{}` | Further host directories exposed read-only, as `{ <name>: <host directory> }`. The key is the mount point and the value is the host directory behind it, so a nested host directory gets a name of the operator's choosing: `my_files: /home/deepseek/my_files` exposes it at `/my_files`, and the host path itself stays unnameable. The key is one top-level segment, with or without its leading slash; a nested key, a non-absolute host directory, or a name a built-in mount or `/tmp` already has fails at load. |
 | `cleanupPeriodDays` | `30` | Age at which `spill-bwrap`'s one startup sweep reclaims an artifact and prunes the session directory it emptied. `0` disables the sweep. Retention is deliberate: a resumed or forked session may still reference an older locator until it ages out. |
 
 `guard-bwrap` also owns which tools it fences, because the mounted tool set varies
@@ -824,12 +837,15 @@ with `bash` does not.
   control — and the stock provider behaves identically, so this is bubblewrap's
   behaviour rather than this composition's. `--dev-bind /dev /dev` fixes the name
   but exposes every host terminal, which is why it is not the default.
-- **An extra mount root reaches the file tools only.** `additionalReadOnlyRoots`
-  is read by `fs-bwrap` and `guard-bwrap`; `bwrap-sandbox` does not bind those
-  directories, so a confined process cannot see them. That is the safe
-direction — the tools learn about a tree the sandbox already cannot reach —
-  but it means the two views of the filesystem differ, and binding `/tmp`
-  there would also override its private-tmp mask.
+- **An extra mount root is one name, and the host directory behind it is free.**
+  `additionalReadOnlyRoots` is read by all four rows, so a directory the operator
+  adds is visible to the file tools and to a confined process at the same name.
+  The name has to be a single top-level segment because a mount point is created
+  on the namespace root, and a read-only bind cannot host a mount point inside
+  it — which is also why the host directory may be nested while its name cannot:
+  `my_files: /home/deepseek/my_files` binds under `/my_files` and leaves
+  `/home/deepseek` unnameable. `/tmp` is reserved while `privateTmp` is on, since
+  the private tmpfs would otherwise hide the mount.
 - **The session cwd is `/workspace`, which moves the session log and breaks
   resume of sessions recorded before it.** The headless runner takes the session
   cwd from `fs.processPath`, so sessions are keyed under

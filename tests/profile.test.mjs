@@ -32,6 +32,7 @@ async function withProfile(body) {
     agentsHome: join(root, 'agents'),
     skillsRoot: join(dsh, 'skills'),
     userInstructionsFile: join(dsh, 'AGENTS.md'),
+    additionalReadOnlyRoots: [],
     privateTmp: true,
     writableRoots: [],
     dropEnv: ['DSH_HOME', 'DSH_PROFILE_DIR'],
@@ -56,6 +57,19 @@ function indexOfSequence(argv, sequence, from = 0) {
   }
   return -1
 }
+
+test('an extra root is bound at the name it was given, not at its host path', () =>
+  withProfile(({ config, policy, root }) => {
+    const extra = join(root, 'my_files')
+    mkdirSync(extra, { recursive: true })
+    const argv = profileArgs(policy, { ...config, additionalReadOnlyRoots: [{ at: '/my_files', host: extra }] })
+
+    assert.ok(indexOfSequence(argv, ['--ro-bind', extra, '/my_files']) >= 0, 'the host directory is bound at the chosen name')
+    // Its host path is not a mount point here, so nothing inside the sandbox
+    // spells it.
+    assert.equal(argv.includes(extra), true, 'the host path appears once, as the bind source')
+    assert.equal(argv.filter(token => token === extra).length, 1)
+  }))
 
 test('masking follows the system binds, and every later mount wins at its path', () =>
   withProfile(({ config, policy }) => {

@@ -32,6 +32,17 @@ function call(name, args, cwd = '/workspace') {
   return { name, arguments: args, agent: { session: { header: { cwd } } } }
 }
 
+/**
+ * Assert one refusal is exactly the answer any path the sandbox does not have
+ * gets: the caller's own argument, and nothing else. No sandbox counterpart, and
+ * no hint that a host spelling was recognized.
+ * @param denied - the guard's decision, which must be a denial message.
+ * @param argument - the value the guard was given.
+ */
+function assertHostRefusal(denied, argument) {
+  assert.equal(denied, `cannot access ${JSON.stringify(argument)}: not found`)
+}
+
 test('the shipped table is the field default, and omitting the field uses it', () => {
   assert.deepEqual(Config({}).pathArguments, { ...DEFAULT_PATH_ARGUMENTS })
   assert.deepEqual(Config({}).pathArrayArguments, { ...DEFAULT_PATH_ARRAY_ARGUMENTS })
@@ -113,11 +124,33 @@ test('a configured array tool is read from the argument the table names', () => 
   assert.equal(wrong(call('attach', { files: [{ path: '/etc/passwd' }] })), undefined)
 })
 
-test('a host spelling in a tool argument is refused, naming the visible path', () => {
+test('a host spelling in a tool argument is refused like any absent path', () => {
   const guard = guardFor({})
-  const denied = guard(call('read', { file_path: `${HOST_WORKSPACE}/notes.md` }, HOST_WORKSPACE))
-  assert.match(denied, /is a host path/)
-  assert.match(denied, /"\/workspace\/notes\.md"/, 'the message names the path the sandbox shows')
+  const argument = `${HOST_WORKSPACE}/notes.md`
+  const denied = guard(call('read', { file_path: argument }, HOST_WORKSPACE))
+  assertHostRefusal(denied, argument)
+  // Every candidate the guard cannot place gets this one answer, character for
+  // character once the path the caller typed is factored out — a host path that
+  // exists, one that does not, a name outside every root, and the mount root
+  // itself. Which of them is a host spelling is not recoverable from the reply,
+  // so guessing the host workspace path tells the caller nothing.
+  const unknowns = [
+    `${HOST_WORKSPACE}/notes.md`,
+    `${HOST_WORKSPACE}/absent.md`,
+    '/totally/made/up',
+    HOST_WORKSPACE,
+    '/etc/passwd',
+  ]
+  const shapes = unknowns.map((candidate) => {
+    const reply = guard(call('read', { file_path: candidate }, HOST_WORKSPACE))
+    assertHostRefusal(reply, candidate)
+    return reply.replace(JSON.stringify(candidate), 'PATH')
+  })
+  assert.equal(new Set(shapes).size, 1, `one answer for every unplaceable path, got ${JSON.stringify(shapes)}`)
+  // A name inside the namespace is a different question — the caller already
+  // knows /workspace is the namespace root, and existence under it says nothing
+  // about host spellings — so it keeps the tool's own answer.
+  assert.equal(guard(call('read', { file_path: '/workspace/absent.md' }, HOST_WORKSPACE)), undefined)
   // The same file under its visible name is still allowed, and a relative path
   // belongs to the namespace by definition.
   assert.equal(guard(call('read', { file_path: '/workspace/notes.md' }, HOST_WORKSPACE)), undefined)
@@ -126,12 +159,12 @@ test('a host spelling in a tool argument is refused, naming the visible path', (
 
 test('the working-directory arguments are fenced the same way', () => {
   const guard = guardFor({})
-  for (const [name, args] of [
-    ['bash', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }],
-    ['pwsh', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }],
-    ['terminal', { command: 'ls', cwd: HOST_WORKSPACE }],
+  for (const [name, args, argument] of [
+    ['bash', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }, `${HOST_WORKSPACE}/src`],
+    ['pwsh', { command: 'ls', workdir: `${HOST_WORKSPACE}/src` }, `${HOST_WORKSPACE}/src`],
+    ['terminal', { command: 'ls', cwd: HOST_WORKSPACE }, HOST_WORKSPACE],
   ]) {
-    assert.match(guard(call(name, args, HOST_WORKSPACE)), /is a host path/, `${name} is fenced by default`)
+    assertHostRefusal(guard(call(name, args, HOST_WORKSPACE)), argument)
   }
   assert.equal(guard(call('bash', { command: 'ls' }, HOST_WORKSPACE)), undefined)
   assert.equal(guard(call('bash', { command: 'ls', workdir: 'src' }, HOST_WORKSPACE)), undefined)
@@ -146,9 +179,9 @@ test('a call without an agent session is fenced against the same mounts', () => 
   // not need a session. The former early return deferred every agentless call to
   // the backend, which cannot see `grep`, `glob`, `lsp`, `bash`, `pwsh`, or
   // `terminal` — the tools only this guard covers.
-  assert.match(guard(agentless('read', { file_path: `${HOST_WORKSPACE}/notes.md` })), /is a host path/)
+  assertHostRefusal(guard(agentless('read', { file_path: `${HOST_WORKSPACE}/notes.md` })), `${HOST_WORKSPACE}/notes.md`)
   assert.match(guard(agentless('read', { file_path: '/etc/passwd' })), /not found/)
-  assert.match(guard(agentless('bash', { command: 'ls', workdir: HOST_WORKSPACE })), /is a host path/)
+  assertHostRefusal(guard(agentless('bash', { command: 'ls', workdir: HOST_WORKSPACE })), HOST_WORKSPACE)
   assert.equal(guard(agentless('read', { file_path: '/workspace/notes.md' })), undefined)
   assert.equal(guard(agentless('bash', { command: 'ls' })), undefined)
 })

@@ -59,7 +59,7 @@ const mountsSchema = z.object({
   agentsHome: z.string().default(''),
   skillsRoot: z.string().default(''),
   userInstructionsFile: z.string().default(''),
-  additionalReadOnlyRoots: z.array(z.string()).default([]),
+  additionalReadOnlyRoots: z.dict(z.string()).default({}),
   writableRoots: z.array(z.string()).default([]),
 })
 
